@@ -1,0 +1,1051 @@
+import ActivityKit
+import SwiftUI
+import UIKit
+import WidgetKit
+
+/// Live Activity for one Host. The lock-screen banner gives each visible
+/// Agent its configured fields, with a height-limited set of Agent cards. Rows
+/// arrive in the sender's pin-aware order and are rendered as given.
+/// Agent rows deep-link to their detail while
+/// the surrounding chrome opens the Console.
+struct AgentLiveActivityWidget: Widget {
+    var body: some WidgetConfiguration {
+        ActivityConfiguration(for: AgentActivityAttributes.self) { context in
+            AgentActivityLockScreenContainer(
+                presentation: AgentActivityDecryptor.presentation(for: context.state),
+                hostID: context.attributes.hostID,
+                isStale: context.isStale
+            )
+        } dynamicIsland: { context in
+            AgentActivityIsland.make(
+                presentation: AgentActivityDecryptor.presentation(for: context.state),
+                hostID: context.attributes.hostID)
+        }
+    }
+}
+
+// MARK: - Surface seam
+
+enum AgentActivitySurface {
+    /// Lock Screen banner. Status colors remain dynamic so ActivityKit can
+    /// resolve Latte in Light appearance and Mocha in Dark appearance.
+    case lockScreen
+    /// Compact, minimal, and expanded Dynamic Island. Always Mocha,
+    /// resolved against a dark trait collection, ignoring ambient Light Mode.
+    case island
+}
+
+enum AgentActivityStatusStyle {
+    static func ink(for status: String, on surface: AgentActivitySurface) -> Color {
+        Color(uiColor: resolvedUIColor(for: status, role: .ink, on: surface))
+    }
+
+    static func wash(for status: String, on surface: AgentActivitySurface) -> Color {
+        Color(uiColor: resolvedUIColor(for: status, role: .wash, on: surface))
+    }
+
+    private enum Role { case ink, wash }
+
+    private static func resolvedUIColor(
+        for status: String, role: Role, on surface: AgentActivitySurface
+    ) -> UIColor {
+        let agentStatus = paletteStatus(for: status)
+        let uiColor: UIColor
+        switch role {
+        case .ink: uiColor = agentStatus.inkUIColor
+        case .wash: uiColor = agentStatus.tintUIColor
+        }
+        switch surface {
+        case .lockScreen:
+            return uiColor
+        case .island:
+            return uiColor.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark))
+        }
+    }
+
+    private static func paletteStatus(for status: String) -> AgentStatus {
+        switch status {
+        case "blocked", "done", "working":
+            return AgentStatus(rawValue: status)
+        default:
+            return .unknown
+        }
+    }
+}
+
+enum AgentActivitySemanticStyle {
+    static func primary(on surface: AgentActivitySurface) -> Color {
+        switch surface {
+        case .lockScreen:
+            Color(uiColor: .label)
+        case .island:
+            Color.primary
+        }
+    }
+
+    static func secondary(on surface: AgentActivitySurface) -> Color {
+        switch surface {
+        case .lockScreen:
+            Color(uiColor: .secondaryLabel)
+        case .island:
+            Color.secondary
+        }
+    }
+}
+
+// MARK: - Lock screen
+
+private struct AgentActivityLockScreenContainer: View {
+    let presentation: AgentActivityPresentation
+    let hostID: String
+    let isStale: Bool
+
+    var body: some View {
+        AgentActivityLockScreenView(
+            presentation: presentation,
+            hostID: hostID,
+            isStale: isStale
+        )
+        .foregroundStyle(AgentActivitySemanticStyle.primary(on: .lockScreen))
+        .activityBackgroundTint(Color(uiColor: AgentActivityLockScreenChrome.backgroundColor))
+        .activitySystemActionForegroundColor(
+            Color(uiColor: AgentActivityLockScreenChrome.actionColor))
+    }
+}
+
+enum AgentActivityLockScreenChrome {
+    /// Keep these semantic colors unresolved so ActivityKit can apply the
+    /// system appearance when its host provides the correct trait collection.
+    static let backgroundColor = UIColor.systemBackground
+    static let actionColor = UIColor.label
+}
+
+struct AgentActivityLockScreenView: View {
+    let presentation: AgentActivityPresentation
+    let hostID: String
+    let isStale: Bool
+
+    var body: some View {
+        ZStack {
+            Color(uiColor: AgentActivityLockScreenChrome.backgroundColor)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 0) {
+                header
+                ForEach(
+                    visibleAgents.dropFirst(), id: \.paneID
+                ) { @Sendable [rowMinimumHeight] agent in
+                    AgentActivityLinkedRow(
+                        hostID: hostID,
+                        agent: agent,
+                        surface: .lockScreen,
+                        minimumHeight: rowMinimumHeight)
+                }
+                if let caption = presentation.lockScreenTrailingCaption(isStale: isStale) {
+                    Text(caption)
+                        .font(.caption2)
+                        .foregroundStyle(AgentActivitySemanticStyle.secondary(on: .lockScreen))
+                }
+                #if DEBUG
+                    if let reason = AgentActivityDecryptor.lastFailureReason {
+                        Text(reason)
+                            .font(.caption2)
+                            .foregroundStyle(
+                                AgentActivitySemanticStyle.secondary(on: .lockScreen)
+                            )
+                            .lineLimit(3)
+                    }
+                #endif
+            }
+            .padding(.horizontal, 14)
+            .padding(.vertical, AgentActivityRowMetrics.lockScreenBannerVerticalPadding)
+        }
+        .widgetURL(AgentActivityLink.consoleURL(hostID: hostID))
+    }
+
+    private var visibleAgents: [AgentActivityDetails.AgentDetail] {
+        presentation.lockScreenAgents(isStale: isStale)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 8) {
+            headline
+            Spacer(minLength: 8)
+            AgentActivityCountChips(counts: presentation.counts, surface: .lockScreen)
+        }
+    }
+
+    @ViewBuilder
+    private var headline: some View {
+        if let first = visibleAgents.first {
+            AgentActivityLinkedRow(
+                hostID: hostID,
+                agent: first,
+                surface: .lockScreen,
+                minimumHeight: rowMinimumHeight)
+        } else {
+            Text(presentation.headerTitle)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(AgentActivitySemanticStyle.primary(on: .lockScreen))
+                .lineLimit(1)
+        }
+    }
+
+    private var rowMinimumHeight: CGFloat {
+        AgentActivityRowMetrics.lockScreenMinimumHeight(agentCount: visibleAgents.count)
+    }
+}
+
+// MARK: - Dynamic Island
+
+/// The island speaks in status tokens: a glyph whose shape names the status,
+/// then that status's count. The most urgent status leads; the others trail.
+enum AgentActivityIsland {
+    static func make(presentation: AgentActivityPresentation, hostID: String) -> DynamicIsland {
+        let counts = presentation.counts
+        return DynamicIsland {
+            DynamicIslandExpandedRegion(.leading) {
+                AgentActivityIslandHeadline(counts: counts)
+            }
+            DynamicIslandExpandedRegion(.trailing) {
+                AgentActivityIslandTrailingTokens(counts: counts)
+                    .frame(
+                        maxWidth: .infinity, minHeight: AgentActivityIslandMetrics.headerHeight,
+                        alignment: .trailing)
+            }
+            DynamicIslandExpandedRegion(.bottom) {
+                AgentActivityIslandRows(presentation: presentation, hostID: hostID)
+            }
+        } compactLeading: {
+            AgentActivityCompactLeading(counts: counts)
+        } compactTrailing: {
+            AgentActivityCompactTrailing(counts: counts)
+        } minimal: {
+            AgentActivityMinimal(counts: counts)
+        }
+        .contentMargins(
+            [.leading, .trailing], AgentActivityIslandMetrics.expandedSideMargin, for: .expanded)
+        .keylineTint(islandKeylineTint(counts: counts))
+        .widgetURL(AgentActivityLink.consoleURL(hostID: hostID))
+    }
+
+    private static func islandKeylineTint(
+        counts: AgentActivityAttributes.ContentState.Counts
+    ) -> Color {
+        if counts.blocked > 0 {
+            return AgentActivityStatusStyle.ink(for: "blocked", on: .island)
+        }
+        return AgentActivityStatusStyle.ink(for: "unknown", on: .island)
+    }
+}
+
+enum AgentActivityIslandMetrics {
+    /// Glyph beside a count in the compact presentation and expanded tally.
+    static let tokenGlyph: CGFloat = 15
+    static let minimalGlyph: CGFloat = 13
+    static let rowGlyph: CGFloat = 13
+    /// The expanded headline glyph is this wide and each row glyph is centered
+    /// in a column this wide, so glyph centers and text edges share one line.
+    static let markerColumn: CGFloat = 19
+    /// Matches the gap between a row's marker and its text.
+    static let markerSpacing: CGFloat = 7
+    /// Shared by the expanded leading and trailing regions so their contents
+    /// sit on one center line beside the camera.
+    static let headerHeight: CGFloat = 20
+    /// The system clips expanded content to the island's shape inset about
+    /// 15 pt, whose 27 pt corners cut into the default 18 pt side margins: the
+    /// header glyph lost its top-left edge and the last trailing digit its
+    /// right half. Measured on an iPhone 17 Pro simulator (iOS 27).
+    static let expandedSideMargin: CGFloat = 25
+    static let rowSpacing: CGFloat = 2
+    /// Line heights of the `.caption` first line and `.caption2` later lines.
+    static let rowFirstLineHeight: CGFloat = 16
+    static let rowLineHeight: CGFloat = 13
+    static let overflowCaptionHeight: CGFloat = 12
+    /// Height the expanded island leaves for the rows and their overflow
+    /// caption. Measured on an iPhone 17 Pro simulator (iOS 27): the rows
+    /// start 46 pt below the island's top edge (system inset, header, and the
+    /// gap under it) and the system clips content 13 pt above the bottom
+    /// edge, which sits at most 160 pt down. A smaller bottom content margin
+    /// shortens the island without moving that clip.
+    static let rowsHeightBudget: CGFloat = 100
+
+    /// A row's text height. The island has no room for the lock screen's
+    /// padded 44 pt cards, so rows hug their lines; a one-line row still
+    /// keeps the dense target as its pitch.
+    static func rowHeight(for agent: AgentActivityDetails.AgentDetail) -> CGFloat {
+        let lines = AgentActivityFields.rows(for: agent).count
+        return max(
+            AgentActivityRowMetrics.denseMinimumHeight - rowSpacing,
+            rowFirstLineHeight + CGFloat(max(0, lines - 1)) * rowLineHeight)
+    }
+}
+
+extension View {
+    /// The expanded island cannot grow past 160 pt, and its glyphs and row
+    /// budget are sized for the default text size, so larger Dynamic Type
+    /// sizes stop there instead of pushing rows under the clip.
+    func islandTypeSize() -> some View {
+        dynamicTypeSize(...DynamicTypeSize.large)
+    }
+}
+
+/// Status shapes, so the tally never relies on color alone: an exclamation
+/// mark asks for the user, a check mark has a result to read, an open ring is
+/// still running.
+struct AgentActivityStatusGlyph: View {
+    let status: String
+    let size: CGFloat
+
+    var body: some View {
+        Group {
+            switch status {
+            case "blocked":
+                Image(systemName: "exclamationmark.circle.fill").resizable().scaledToFit()
+            case "done":
+                Image(systemName: "checkmark.circle.fill").resizable().scaledToFit()
+            case "working":
+                openRing
+            default:
+                Circle().padding(size * 0.23)
+            }
+        }
+        .frame(width: size, height: size)
+        .foregroundStyle(AgentActivityStatusStyle.ink(for: status, on: .island))
+        .accessibilityHidden(true)
+    }
+
+    /// Drawn rather than a symbol: a Live Activity cannot spin, so the ring
+    /// stays open to read as unfinished at rest.
+    private var openRing: some View {
+        let lineWidth = size * 0.14
+        let ink = AgentActivityStatusStyle.ink(for: status, on: .island)
+        return ZStack {
+            Circle().stroke(ink.opacity(0.28), lineWidth: lineWidth)
+            Circle()
+                .trim(from: 0, to: 0.75)
+                .stroke(ink, style: StrokeStyle(lineWidth: lineWidth, lineCap: .round))
+                .rotationEffect(.degrees(-90))
+        }
+        .padding(lineWidth / 2)
+    }
+}
+
+/// One status on the island: its glyph, then its count, in that status's ink.
+struct AgentActivityStatusToken: View {
+    let status: String
+    /// Nil draws the glyph alone.
+    let count: Int?
+    var glyphSize = AgentActivityIslandMetrics.tokenGlyph
+    var font = Font.subheadline.weight(.semibold)
+
+    var body: some View {
+        HStack(spacing: 3) {
+            AgentActivityStatusGlyph(status: status, size: glyphSize)
+            if let count {
+                Text("\(count)")
+            }
+        }
+        .font(font.monospacedDigit())
+        .foregroundStyle(AgentActivityStatusStyle.ink(for: status, on: .island))
+    }
+}
+
+/// The most urgent status. When it is the only status, its count moves across
+/// the camera to the trailing side, so the two sides never repeat one number.
+struct AgentActivityCompactLeading: View {
+    let counts: AgentActivityAttributes.ContentState.Counts
+
+    var body: some View {
+        let items = counts.attentionItems
+        if let top = items.first {
+            AgentActivityStatusToken(status: top.status, count: items.count > 1 ? top.count : nil)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(top.count) \(top.status)")
+        }
+    }
+}
+
+struct AgentActivityCompactTrailing: View {
+    let counts: AgentActivityAttributes.ContentState.Counts
+
+    var body: some View {
+        let items = counts.attentionItems
+        if items.count == 1, let only = items.first {
+            Text("\(only.count)")
+                .font(.subheadline.weight(.semibold).monospacedDigit())
+                .foregroundStyle(AgentActivityStatusStyle.ink(for: only.status, on: .island))
+                // The leading side already speaks this count.
+                .accessibilityHidden(true)
+        } else {
+            AgentActivityIslandTrailingTokens(counts: counts)
+        }
+    }
+}
+
+/// Every status after the most urgent one, in attention order.
+struct AgentActivityIslandTrailingTokens: View {
+    let counts: AgentActivityAttributes.ContentState.Counts
+
+    var body: some View {
+        let rest = Array(counts.attentionItems.dropFirst())
+        if !rest.isEmpty {
+            HStack(spacing: 7) {
+                ForEach(rest, id: \.status) { @Sendable item in
+                    AgentActivityStatusToken(status: item.status, count: item.count)
+                }
+            }
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(AgentActivityNarration.countsLabel(rest))
+            .islandTypeSize()
+        }
+    }
+}
+
+struct AgentActivityMinimal: View {
+    let counts: AgentActivityAttributes.ContentState.Counts
+
+    var body: some View {
+        if let top = counts.attentionItems.first {
+            AgentActivityStatusToken(
+                status: top.status, count: top.count,
+                glyphSize: AgentActivityIslandMetrics.minimalGlyph,
+                font: .footnote.weight(.bold)
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel(AgentActivityNarration.countsLabel(counts.attentionItems))
+        }
+    }
+}
+
+/// Expanded leading region: the most urgent status, spelled out.
+struct AgentActivityIslandHeadline: View {
+    let counts: AgentActivityAttributes.ContentState.Counts
+
+    var body: some View {
+        if let top = counts.attentionItems.first {
+            HStack(spacing: AgentActivityIslandMetrics.markerSpacing) {
+                AgentActivityStatusGlyph(
+                    status: top.status, size: AgentActivityIslandMetrics.markerColumn)
+                Text("\(top.count) \(top.status)")
+                    .font(.subheadline.weight(.semibold).monospacedDigit())
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
+            }
+            .foregroundStyle(AgentActivityStatusStyle.ink(for: top.status, on: .island))
+            .frame(
+                maxWidth: .infinity, minHeight: AgentActivityIslandMetrics.headerHeight,
+                alignment: .leading
+            )
+            .accessibilityElement(children: .ignore)
+            .accessibilityLabel("\(top.count) \(top.status)")
+            .islandTypeSize()
+        }
+    }
+}
+
+/// Expanded bottom region: as many Agent rows as the island's height allows.
+struct AgentActivityIslandRows: View {
+    let presentation: AgentActivityPresentation
+    let hostID: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: AgentActivityIslandMetrics.rowSpacing) {
+            ForEach(presentation.expandedAgents, id: \.paneID) { @Sendable agent in
+                AgentActivityLinkedRow(
+                    hostID: hostID,
+                    agent: agent,
+                    surface: .island,
+                    minimumHeight: AgentActivityIslandMetrics.rowHeight(for: agent))
+            }
+            if presentation.overflowCount > 0 {
+                Text("+\(presentation.overflowCount) more")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .padding(
+                        .leading,
+                        AgentActivityIslandMetrics.markerColumn
+                            + AgentActivityIslandMetrics.markerSpacing)
+                    .frame(height: AgentActivityIslandMetrics.overflowCaptionHeight)
+            }
+        }
+        .islandTypeSize()
+    }
+}
+
+enum AgentActivityNarration {
+    static func rowLabel(for agent: AgentActivityDetails.AgentDetail) -> String {
+        let rows = AgentActivityFields.rows(for: agent).map { $0.map(\.text).joined() }
+        return (rows.filter { !$0.isEmpty } + [agent.status]).joined(separator: ", ")
+    }
+
+    static func countsLabel(_ items: [(status: String, count: Int)]) -> String {
+        items.map { "\($0.count) \($0.status)" }.joined(separator: ", ")
+    }
+}
+
+// MARK: - Shared pieces
+
+enum AgentActivityRowMetrics {
+    /// Apple's default iOS control size when the presentation has room.
+    static let comfortableMinimumHeight: CGFloat = 44
+    /// Apple's documented minimum iOS control size for dense layouts.
+    static let denseMinimumHeight: CGFloat = 28
+
+    static func lockScreenMinimumHeight(agentCount: Int) -> CGFloat {
+        agentCount <= 3 ? comfortableMinimumHeight : denseMinimumHeight
+    }
+
+    /// Three configured rows render at about 43.5 pt (caption + 2 x caption2
+    /// plus the card's vertical padding), so a three-row card is held to the
+    /// comfortable 44 pt target; two rows or fewer fit the dense target.
+    static let threeRowMinimumHeight: CGFloat = comfortableMinimumHeight
+
+    /// Vertical padding of the whole lock-screen banner.
+    static let lockScreenBannerVerticalPadding: CGFloat = 6
+    /// Rendered height of the trailing caption2 line (overflow / stale).
+    static let lockScreenCaptionHeight: CGFloat = 14
+    /// ActivityKit's lock-screen presentation height limit.
+    static let lockScreenHeightBudget: CGFloat = 160
+
+    static func minimumHeight(for agent: AgentActivityDetails.AgentDetail) -> CGFloat {
+        AgentActivityFields.rows(for: agent).count > 2 ? threeRowMinimumHeight : denseMinimumHeight
+    }
+}
+
+/// Wraps row content in a deep link to that Agent's detail. The outer
+/// widgetURL remains the fallback for taps on the surrounding chrome.
+private struct AgentActivityLinked<Content: View>: View {
+    let hostID: String
+    let agent: AgentActivityDetails.AgentDetail
+    let surface: AgentActivitySurface
+    let minimumHeight: CGFloat
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        if let url = AgentActivityLink.agentURL(hostID: hostID, paneID: agent.paneID) {
+            Link(destination: url) {
+                content
+                    .frame(maxWidth: .infinity, minHeight: minimumHeight, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .tint(AgentActivitySemanticStyle.primary(on: surface))
+            .accessibilityLabel(AgentActivityNarration.rowLabel(for: agent))
+            .accessibilityHint("Opens this Agent in Mercurio")
+        } else {
+            content
+                .frame(maxWidth: .infinity, minHeight: minimumHeight, alignment: .leading)
+        }
+    }
+}
+
+private struct AgentActivityLinkedRow: View {
+    let hostID: String
+    let agent: AgentActivityDetails.AgentDetail
+    let surface: AgentActivitySurface
+    let minimumHeight: CGFloat
+
+    var body: some View {
+        AgentActivityLinked(
+            hostID: hostID,
+            agent: agent,
+            surface: surface,
+            minimumHeight: surface == .island
+                ? minimumHeight
+                : max(minimumHeight, AgentActivityRowMetrics.minimumHeight(for: agent))
+        ) {
+            AgentActivityRowView(agent: agent, surface: surface)
+        }
+    }
+}
+
+private struct AgentActivityCountChips: View {
+    let counts: AgentActivityAttributes.ContentState.Counts
+    let surface: AgentActivitySurface
+
+    var body: some View {
+        HStack(spacing: 5) {
+            ForEach(counts.chipItems, id: \.status) { @Sendable item in
+                Text("\(item.count) \(item.status)")
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(AgentActivityStatusStyle.ink(for: item.status, on: surface))
+                    // Chips never compress or wrap; the row title truncates
+                    // instead when all three statuses are present.
+                    .fixedSize()
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(
+                        AgentActivityStatusStyle.wash(for: item.status, on: surface).opacity(0.15),
+                        in: Capsule())
+            }
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            counts.chipItems.map { "\($0.count) \($0.status)" }.joined(separator: ", "))
+    }
+}
+
+/// The same rendered field rows used by the Console, with a status marker
+/// that remains visible even when every configured field is empty.
+enum AgentActivityFields {
+    static func rows(for agent: AgentActivityDetails.AgentDetail) -> [[AgentActivityDetails.Field]] {
+        if let configured = agent.rows { return Array(configured.prefix(3)) }
+        let kind = AgentNotificationIdentity.kindLabel(agent.kind)
+        if let workspace = agent.displayWorkspace {
+            return [[.init(text: workspace)], [.init(text: kind)]]
+        }
+        return [[.init(text: kind)]]
+    }
+
+    static func attributedText(
+        _ fields: [AgentActivityDetails.Field], rowIndex: Int, surface: AgentActivitySurface
+    ) -> AttributedString {
+        var result = AttributedString()
+        for field in fields {
+            var span = AttributedString(field.text)
+            let font: Font = rowIndex == 0 ? .caption : .caption2
+            let weight: Font.Weight = if let bold = field.bold {
+                bold ? .bold : .regular
+            } else {
+                rowIndex == 0 ? .semibold : .medium
+            }
+            span.font = font.weight(weight)
+            span.foregroundColor = foreground(for: field, rowIndex: rowIndex, surface: surface)
+            result.append(span)
+        }
+        return result
+    }
+
+    static func foreground(
+        for field: AgentActivityDetails.Field, rowIndex: Int, surface: AgentActivitySurface
+    ) -> Color {
+        if let hex = field.fg, let color = hexColor(hex) {
+            return Color(uiColor: color).opacity(field.dim == true ? 0.6 : 1)
+        }
+        if field.dim == true {
+            let color: UIColor = rowIndex == 0 ? .secondaryLabel : .tertiaryLabel
+            return Color(uiColor: surface == .island
+                ? color.resolvedColor(with: UITraitCollection(userInterfaceStyle: .dark)) : color)
+        }
+        return rowIndex == 0
+            ? AgentActivitySemanticStyle.primary(on: surface)
+            : AgentActivitySemanticStyle.secondary(on: surface)
+    }
+
+    private static func hexColor(_ value: String) -> UIColor? {
+        guard value.first == "#", value.utf8.count == 4 || value.utf8.count == 7 else { return nil }
+        let digits = value.dropFirst()
+        guard digits.utf8.allSatisfy({
+            (48...57).contains($0) || (65...70).contains($0) || (97...102).contains($0)
+        }) else { return nil }
+        let expanded = digits.count == 3 ? digits.map { "\($0)\($0)" }.joined() : String(digits)
+        guard let rgb = UInt32(expanded, radix: 16) else { return nil }
+        return UIColor(
+            red: CGFloat((rgb >> 16) & 0xff) / 255,
+            green: CGFloat((rgb >> 8) & 0xff) / 255,
+            blue: CGFloat(rgb & 0xff) / 255, alpha: 1)
+    }
+}
+
+struct AgentActivityRowView: View {
+    let agent: AgentActivityDetails.AgentDetail
+    let surface: AgentActivitySurface
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 7) {
+            marker
+            VStack(alignment: .leading, spacing: 0) {
+                ForEach(
+                    Array(AgentActivityFields.rows(for: agent).enumerated()), id: \.offset
+                ) { @Sendable index, row in
+                    Text(AgentActivityFields.attributedText(row, rowIndex: index, surface: surface))
+                        .lineLimit(1)
+                }
+            }
+        }
+        .padding(.vertical, agent.rows == nil || surface == .island ? 0 : 1)
+        .layoutPriority(1)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(AgentActivityNarration.rowLabel(for: agent))
+    }
+
+    /// A dot on the Lock Screen, where the chips name each status; the
+    /// island's own glyph there, matching the tokens in its header.
+    @ViewBuilder
+    private var marker: some View {
+        switch surface {
+        case .lockScreen:
+            Circle()
+                .fill(AgentActivityStatusStyle.ink(for: agent.status, on: surface))
+                .frame(width: 7, height: 7)
+                .padding(.top, 4)
+                .accessibilityHidden(true)
+        case .island:
+            AgentActivityStatusGlyph(
+                status: agent.status, size: AgentActivityIslandMetrics.rowGlyph
+            )
+            .frame(width: AgentActivityIslandMetrics.markerColumn)
+            .padding(.top, 1.5)
+        }
+    }
+}
+
+// MARK: - Previews
+
+/// Style gallery: every lock-screen state without a device, a push, or a
+/// live agent. Open this file's canvas in Xcode to review the banner.
+#if DEBUG
+    private func previewAgent(
+        _ status: String, kind: String, workspace: String? = "Mercurio", name: String? = nil,
+        pane: String, title: String? = nil
+    ) -> AgentActivityDetails.AgentDetail {
+        AgentActivityDetails.AgentDetail(
+            paneID: pane, kind: kind, name: name, workspace: workspace, status: status,
+            title: title)
+    }
+
+    private enum AgentActivityPreviewFixtures {
+        static let longGraphemeTitle = String(repeating: "锁", count: 80)
+        static let longGraphemeName = String(repeating: "屏", count: 80)
+
+        static var configuredFields: AgentActivityPresentation {
+            let agents = (1...4).map { index in
+                AgentActivityDetails.AgentDetail(
+                    paneID: "w1:p\(index)", kind: "claude", workspace: "Mercurio",
+                    status: index == 1 ? "blocked" : "working", title: nil,
+                    rows: [
+                        [.init(text: "Mercurio"), .init(text: " · "), .init(text: "Claude", dim: true)],
+                        [.init(text: "Review sidebar fields")],
+                        [.init(text: "~/Projects/Mercurio", dim: true)],
+                    ])
+            }
+            return .detailed(details: .init(hostName: "mbp", agents: agents),
+                counts: .init(working: 3, blocked: 1, done: 0))
+        }
+
+        static var mixedOverflow: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent(
+                            "blocked", kind: "claude", name: "reviewer", pane: "w1:p1",
+                            title: "Approve the transport refactor plan"),
+                        previewAgent(
+                            "done", kind: "droid", name: "doc-writer", pane: "w1:p2",
+                            title: "API reference draft finished"),
+                        previewAgent(
+                            "working", kind: "grok", name: "la-demo", pane: "w1:p3",
+                            title: "Research ActivityKit budgets"),
+                        previewAgent(
+                            "working", kind: "codex", name: "fixer", pane: "w1:p4",
+                            title: "Chase the flaky pairing test"),
+                        previewAgent(
+                            "working", kind: "claude", pane: "w1:p5",
+                            title: "Refactor the transport queue"),
+                    ]),
+                counts: .init(working: 4, blocked: 1, done: 1))
+        }
+
+        static var singleUnnamedIdentityOnly: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [previewAgent("working", kind: "claude", pane: "w1:p1")]),
+                counts: .init(working: 1, blocked: 0, done: 0))
+        }
+
+        static var fourRows: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent(
+                            "blocked", kind: "claude", name: "reviewer", pane: "w1:p1",
+                            title: "Approve the transport refactor plan"),
+                        previewAgent(
+                            "working", kind: "claude", pane: "w1:p2",
+                            title: "Refactor the transport queue"),
+                        previewAgent(
+                            "working", kind: "grok", name: "la-demo", pane: "w1:p3",
+                            title: "Write the landing copy"),
+                        previewAgent(
+                            "working", kind: "codex", name: "fixer", pane: "w1:p4",
+                            title: "Chase the flaky pairing test"),
+                    ]),
+                counts: .init(working: 3, blocked: 1, done: 0))
+        }
+
+        static var countsOnly: AgentActivityPresentation {
+            .countsOnly(counts: .init(working: 2, blocked: 1, done: 0))
+        }
+
+        static var longTitle: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent(
+                            "blocked", kind: "claude", name: "reviewer", pane: "w1:p1",
+                            title: longGraphemeTitle),
+                        previewAgent("working", kind: "grok", pane: "w1:p2", title: "Second row"),
+                    ]),
+                counts: .init(working: 1, blocked: 1, done: 1))
+        }
+
+        static var longNameWithTitle: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent(
+                            "blocked", kind: "claude", name: longGraphemeName, pane: "w1:p1",
+                            title: "Approve the transport refactor plan"),
+                    ]),
+                counts: .init(working: 0, blocked: 1, done: 0))
+        }
+
+        static var longNameNoTitle: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent(
+                            "working", kind: "claude", name: longGraphemeName, pane: "w1:p1"),
+                    ]),
+                counts: .init(working: 1, blocked: 0, done: 0))
+        }
+
+        static var staleMaxHeight: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent("blocked", kind: "claude", pane: "w1:p1", title: "First"),
+                        previewAgent("done", kind: "droid", pane: "w1:p2", title: "Second"),
+                        previewAgent("working", kind: "grok", pane: "w1:p3", title: "Third"),
+                        previewAgent("working", kind: "codex", pane: "w1:p4", title: "Fourth"),
+                        previewAgent("working", kind: "claude", pane: "w1:p5", title: "Fifth"),
+                    ]),
+                counts: .init(working: 3, blocked: 1, done: 1))
+        }
+
+        static var staleThreeRows: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent("blocked", kind: "claude", pane: "w1:p1", title: "First"),
+                        previewAgent("done", kind: "droid", pane: "w1:p2", title: "Second"),
+                        previewAgent("working", kind: "grok", pane: "w1:p3", title: "Third"),
+                    ]),
+                counts: .init(working: 1, blocked: 1, done: 1))
+        }
+
+        static var expandedMixed: AgentActivityPresentation {
+            .detailed(
+                details: AgentActivityDetails(
+                    hostName: "mbp",
+                    agents: [
+                        previewAgent(
+                            "blocked", kind: "claude", name: "reviewer", pane: "w1:p1",
+                            title: "Approve the transport refactor plan"),
+                        previewAgent(
+                            "done", kind: "droid", name: "doc-writer", pane: "w1:p2",
+                            title: "API reference draft finished"),
+                        previewAgent(
+                            "working", kind: "grok", name: "la-demo", pane: "w1:p3",
+                            title: "Research ActivityKit budgets"),
+                    ]),
+                counts: .init(working: 1, blocked: 1, done: 1))
+        }
+    }
+
+    private func previewLockScreenBanner(
+        _ presentation: AgentActivityPresentation,
+        colorScheme: ColorScheme,
+        isStale: Bool = false
+    ) -> some View {
+        AgentActivityLockScreenView(
+            presentation: presentation,
+            hostID: "6D8EC348-4DAF-455C-BA8F-5FCC41799C0E",
+            isStale: isStale
+        )
+        .background(
+            colorScheme == .light
+                ? Color(white: 0.97)
+                : Color(red: 28 / 255, green: 28 / 255, blue: 30 / 255),
+            in: RoundedRectangle(cornerRadius: 22, style: .continuous)
+        )
+        .environment(\.colorScheme, colorScheme)
+        .padding()
+    }
+
+    private func previewIslandCompact(
+        counts: AgentActivityAttributes.ContentState.Counts,
+        colorScheme: ColorScheme = .light
+    ) -> some View {
+        HStack(spacing: 0) {
+            AgentActivityCompactLeading(counts: counts)
+            // Stands in for the camera housing between the two sides.
+            Color.clear.frame(width: 126)
+            AgentActivityCompactTrailing(counts: counts)
+        }
+        .padding(.horizontal, 11)
+        .frame(height: 37)
+        .background(Color.black, in: Capsule())
+        .environment(\.colorScheme, colorScheme)
+        .padding()
+    }
+
+    private func previewIslandMinimal(
+        counts: AgentActivityAttributes.ContentState.Counts,
+        colorScheme: ColorScheme = .light
+    ) -> some View {
+        AgentActivityMinimal(counts: counts)
+            .frame(width: 37, height: 37)
+            .background(Color.black, in: Circle())
+            .environment(\.colorScheme, colorScheme)
+            .padding()
+    }
+
+    private func previewIslandExpanded(
+        _ presentation: AgentActivityPresentation,
+        colorScheme: ColorScheme = .light
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 0) {
+                AgentActivityIslandHeadline(counts: presentation.counts)
+                AgentActivityIslandTrailingTokens(counts: presentation.counts)
+            }
+            AgentActivityIslandRows(
+                presentation: presentation, hostID: "6D8EC348-4DAF-455C-BA8F-5FCC41799C0E")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 14)
+        .frame(width: 371)
+        .background(Color.black, in: RoundedRectangle(cornerRadius: 40, style: .continuous))
+        .environment(\.colorScheme, colorScheme)
+        .padding()
+    }
+
+    #Preview("Configured fields (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.configuredFields, colorScheme: .light)
+    }
+
+    #Preview("Configured fields (Dark, stale)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.configuredFields, colorScheme: .dark, isStale: true)
+    }
+
+    #Preview("Configured fields (Expanded island)") {
+        previewIslandExpanded(AgentActivityPreviewFixtures.configuredFields)
+    }
+
+    #Preview("P1 Mixed + overflow (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.mixedOverflow, colorScheme: .light)
+    }
+
+    #Preview("P1 Mixed + overflow (Dark)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.mixedOverflow, colorScheme: .dark)
+    }
+
+    #Preview("P2 Unnamed identity only (Light)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.singleUnnamedIdentityOnly, colorScheme: .light)
+    }
+
+    #Preview("P2 Unnamed identity only (Dark)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.singleUnnamedIdentityOnly, colorScheme: .dark)
+    }
+
+    #Preview("P3 Four rows (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.fourRows, colorScheme: .light)
+    }
+
+    #Preview("P3 Four rows (Dark)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.fourRows, colorScheme: .dark)
+    }
+
+    #Preview("P4 Counts only (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.countsOnly, colorScheme: .light)
+    }
+
+    #Preview("P4 Counts only (Dark)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.countsOnly, colorScheme: .dark)
+    }
+
+    #Preview("P5 Long title (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.longTitle, colorScheme: .light)
+    }
+
+    #Preview("P5 Long title (Dark)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.longTitle, colorScheme: .dark)
+    }
+
+    #Preview("P5a Long name with title (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.longNameWithTitle, colorScheme: .light)
+    }
+
+    #Preview("P5a Long name with title (Dark)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.longNameWithTitle, colorScheme: .dark)
+    }
+
+    #Preview("P5b Long name, no title (Light)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.longNameNoTitle, colorScheme: .light)
+    }
+
+    #Preview("P5b Long name, no title (Dark)") {
+        previewLockScreenBanner(AgentActivityPreviewFixtures.longNameNoTitle, colorScheme: .dark)
+    }
+
+    #Preview("P6 Stale max height (Light)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.staleMaxHeight, colorScheme: .light, isStale: true)
+    }
+
+    #Preview("P6 Stale max height (Dark)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.staleMaxHeight, colorScheme: .dark, isStale: true)
+    }
+
+    #Preview("P6b Stale three rows (Light)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.staleThreeRows, colorScheme: .light, isStale: true)
+    }
+
+    #Preview("P6b Stale three rows (Dark)") {
+        previewLockScreenBanner(
+            AgentActivityPreviewFixtures.staleThreeRows, colorScheme: .dark, isStale: true)
+    }
+
+    #Preview("P7 Compact blocked (Light island)") {
+        previewIslandCompact(counts: .init(working: 2, blocked: 1, done: 0))
+    }
+
+    #Preview("P8 Compact done + working") {
+        previewIslandCompact(counts: .init(working: 2, blocked: 0, done: 1))
+    }
+
+    #Preview("P9 Compact working only") {
+        previewIslandCompact(counts: .init(working: 3, blocked: 0, done: 0))
+    }
+
+    #Preview("P9b Compact all three statuses") {
+        previewIslandCompact(counts: .init(working: 3, blocked: 1, done: 1))
+    }
+
+    #Preview("P10 Minimal blocked (Light island)") {
+        previewIslandMinimal(counts: .init(working: 2, blocked: 1, done: 0))
+    }
+
+    #Preview("P10b Minimal working only") {
+        previewIslandMinimal(counts: .init(working: 2, blocked: 0, done: 0))
+    }
+
+    #Preview("P11 Expanded mixed (Light island)") {
+        previewIslandExpanded(AgentActivityPreviewFixtures.expandedMixed)
+    }
+#endif

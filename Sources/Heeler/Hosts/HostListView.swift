@@ -1,0 +1,1106 @@
+import Observation
+import SwiftUI
+
+struct HostRemovalRequest: Equatable {
+    let hosts: [Host]
+    /// Whether this device holds a Notification Key for any of the Hosts.
+    var deletesNotificationKey = false
+    /// Whether a Host with a Notification Key is not connected, so its
+    /// registration of this device cannot be revoked (#414).
+    var leavesNotificationsBehind = false
+
+    var title: String {
+        if hosts.count == 1, let host = hosts.first {
+            return "Remove \(host.displayName)?"
+        }
+        return "Remove \(hosts.count) Hosts?"
+    }
+
+    var actionTitle: String {
+        hosts.count == 1 ? "Remove Host" : "Remove Hosts"
+    }
+
+    var message: String {
+        var sentences = [
+            deletesNotificationKey
+                ? "This permanently deletes the Host configuration, any saved password, "
+                    + "and the Notification Key from the Keychain."
+                : "This permanently deletes the Host configuration and any saved password "
+                    + "from the Keychain."
+        ]
+        if leavesNotificationsBehind {
+            sentences.append(
+                hosts.count == 1
+                    ? "Mercurio can't reach this Host, so it may keep sending notifications "
+                        + "to this device. Connect to it first to stop them."
+                    : "Mercurio can't reach some of these Hosts, so they may keep sending "
+                        + "notifications to this device. Connect to them first to stop "
+                        + "those notifications.")
+        }
+        sentences.append("This cannot be undone.")
+        return sentences.joined(separator: " ")
+    }
+}
+
+/// What a confirmed Host removal cleans up beyond the catalog entry and
+/// saved password `HostStore.remove` deletes (#414). The app wires it to its
+/// app-wide stores; previews and tests keep the no-op defaults.
+struct HostRemovalDependencies: Sendable {
+    /// The removals under way. App-owned, so a Hosts list rebuilt mid-removal
+    /// still shows them and another window cannot start the same one.
+    var inFlight = HostRemovalsInFlight()
+    /// Whether the Host's connection is up, for the confirmation's copy.
+    var isConnected: @MainActor @Sendable (Host.ID) -> Bool = { _ in false }
+    /// Whether this device holds a Notification Key for the Host.
+    var hasNotificationKey: @MainActor @Sendable (Host.ID) -> Bool = { _ in false }
+    /// Best effort and bounded: asks the Host to stop notifying this device.
+    /// Runs first, while the Host is still in the catalog and its connection
+    /// can still be borrowed; never throws.
+    var revokeNotifications: @MainActor @Sendable (Host) async -> Void = { _ in }
+    /// Deletes the Host's Notification Key. Runs before the catalog removal;
+    /// a throw keeps the Host.
+    var forgetNotificationKey: @MainActor @Sendable (Host.ID) throws -> Void = { _ in }
+    /// Runs once per Host after its catalog removal succeeds, so the Host
+    /// is already gone from `HostStore.hosts`. Not called when it fails.
+    var didRemoveHost: @MainActor @Sendable (Host.ID) -> Void = { _ in }
+}
+
+extension HostRemovalDependencies {
+    /// The app's removal: the Host's own notification registration is
+    /// revoked over its live Console connection, its Notification Key goes
+    /// through the preferences store's key store (volatile in demo mode),
+    /// and once it leaves the catalog its Live Activity ends and its opt-in
+    /// goes with it.
+    @MainActor
+    static func app(
+        console: ConsoleStore,
+        notificationPreferences: NotificationPreferencesStore,
+        liveActivities: HostLiveActivityCoordinator,
+        revokeTimeout: Duration = .seconds(6)
+    ) -> HostRemovalDependencies {
+        HostRemovalDependencies(
+            isConnected: { [weak console] id in console?.hostStatuses[id] == .connected },
+            hasNotificationKey: { [weak notificationPreferences] id in
+                notificationPreferences?.hasNotificationKey(for: id) ?? false
+            },
+            revokeNotifications: { [weak console, weak notificationPreferences] host in
+                await notificationPreferences?.revokeRegistration(
+                    for: host, isConnected: console?.hostStatuses[host.id] == .connected,
+                    timeout: revokeTimeout)
+            },
+            forgetNotificationKey: { [weak notificationPreferences] id in
+                try notificationPreferences?.forgetNotificationKey(for: id)
+            },
+            didRemoveHost: { [weak liveActivities] id in
+                liveActivities?.forgetHost(id)
+            })
+    }
+}
+
+/// The Hosts whose confirmed removal has not finished yet.
+@MainActor
+@Observable
+final class HostRemovalsInFlight {
+    private(set) var hostIDs: Set<Host.ID> = []
+
+    nonisolated init() {}
+
+    func contains(_ id: Host.ID) -> Bool {
+        hostIDs.contains(id)
+    }
+
+    fileprivate func begin(_ ids: [Host.ID]) {
+        hostIDs.formUnion(ids)
+    }
+
+    fileprivate func end(_ ids: [Host.ID]) {
+        hostIDs.subtract(ids)
+    }
+}
+
+extension EnvironmentValues {
+    /// What removing a Host cleans up; see `HostRemovalDependencies`.
+    @Entry var hostRemovalDependencies = HostRemovalDependencies()
+}
+
+/// One Duplicate form presentation, identified per request so duplicating
+/// the same Host again presents a fresh, renumbered draft.
+private struct HostDuplicateRequest: Identifiable {
+    let id = UUID()
+    let draft: HostDraft
+}
+
+/// A fold the host-key check already accepted. Confirming it writes `merged`
+/// and removes `source`.
+private struct PendingHostFold: Identifiable {
+    let id = UUID()
+    let source: Host
+    let merged: Host
+    let targetName: String
+}
+
+@MainActor
+@Observable
+final class HostRemovalStore {
+    private(set) var errorMessage: String?
+    private(set) var pendingRequest: HostRemovalRequest?
+
+    @ObservationIgnored
+    private let store: HostStore
+
+    init(store: HostStore) {
+        self.store = store
+    }
+
+    func requestRemoval(
+        _ ids: [Host.ID],
+        dependencies: HostRemovalDependencies = HostRemovalDependencies()
+    ) {
+        let requestedIDs = Set(ids)
+        let hosts = store.hosts.filter {
+            requestedIDs.contains($0.id) && !dependencies.inFlight.contains($0.id)
+        }
+        guard !hosts.isEmpty else { return }
+        let keyed = hosts.filter { dependencies.hasNotificationKey($0.id) }
+        pendingRequest = HostRemovalRequest(
+            hosts: hosts,
+            deletesNotificationKey: !keyed.isEmpty,
+            leavesNotificationsBehind: keyed.contains { !dependencies.isConnected($0.id) })
+    }
+
+    func cancelRemoval() {
+        pendingRequest = nil
+    }
+
+    /// Removes each Host in turn: revoke its notifications while it can
+    /// still be reached, delete its Notification Key, then its catalog entry
+    /// and password, then whatever else it left behind. A failure stops
+    /// there and keeps that Host and the ones after it.
+    func confirmRemoval(
+        _ request: HostRemovalRequest,
+        dependencies: HostRemovalDependencies = HostRemovalDependencies()
+    ) async {
+        pendingRequest = nil
+        let inFlight = dependencies.inFlight
+        let hosts = request.hosts.filter { !inFlight.contains($0.id) }
+        inFlight.begin(hosts.map(\.id))
+        defer { inFlight.end(hosts.map(\.id)) }
+        for host in hosts {
+            await dependencies.revokeNotifications(host)
+            do {
+                try dependencies.forgetNotificationKey(host.id)
+                try store.remove(host.id)
+            } catch HostStoreError.unknownHost {
+                // Already gone from the catalog: nothing left to keep.
+            } catch {
+                errorMessage = "The Host could not be removed. Its saved credentials may still be in the Keychain."
+                return
+            }
+            dependencies.didRemoveHost(host.id)
+        }
+    }
+
+    func dismissError() {
+        errorMessage = nil
+    }
+}
+
+/// Host management (#14): the catalog of Hosts with add/edit/remove, grouped
+/// by what each needs from the user (#316), every row leading into that
+/// Host's onboarding checklist.
+struct HostListView: View {
+    let store: HostStore
+    private let initialHostID: Host.ID?
+    private let connectionStatuses: [Host.ID: EventsSessionStatus]
+    private let standingFailures: [Host.ID: TransportError]
+    private let latencies: [Host.ID: Duration]
+    /// The route each connected Host reached (ADR 0022).
+    private let routeIDs: [Host.ID: HostRoute.ID]
+    /// Why a connected Host's Agents could not be synced, per Host.
+    private let syncIssues: [Host.ID: String]
+    /// Hosts whose Host-detail Reconnect request is in flight. Distinct from
+    /// `EventsSessionStatus.reconnecting`.
+    private let manualReconnectInFlightHostIDs: Set<Host.ID>
+    private let retryConnection: (@MainActor @Sendable (Host.ID) async -> Void)?
+    /// Stops a Host's connection attempt instead of waiting for its timeout.
+    private let stopConnecting: (@MainActor @Sendable (Host.ID) async -> Void)?
+    /// Where `initialHostID` was opened from. Its detail's back button goes
+    /// back there instead of to this list.
+    private let origin: HostListOrigin?
+    /// Closes the list where it is presented as a sheet, as on iPad; nil
+    /// where it is a tab.
+    private let onDone: (@MainActor () -> Void)?
+    @State private var removal: HostRemovalStore
+    @Environment(\.hostOnboardingDependencies) private var onboardingDependencies
+    @Environment(\.hostRemovalDependencies) private var removalDependencies
+    @State private var isAddingHost = false
+    @State private var editingHost: Host?
+    @State private var duplicateRequest: HostDuplicateRequest?
+    /// The Host the user wants to fold into another. Nil while the picker is down.
+    @State private var sameMachineSourceID: Host.ID?
+    @State private var isCheckingSameMachine = false
+    /// Stashed until the picker sheet has dismissed, so the confirm alert is
+    /// not dropped mid-transition.
+    @State private var foldReady: PendingHostFold?
+    /// A fold whose host keys matched, waiting for the user to confirm removal.
+    @State private var pendingFold: PendingHostFold?
+    @State private var sameMachineError: String?
+    @State private var foldNotice: String?
+    /// State, not `@AppStorage`: a defaults write lands outside the toggle's
+    /// animation, so the group would snap shut.
+    @State private var collapsedGroups: Set<HostHealthGroup>
+    @State private var isScanningToPair = false
+    @State private var manualFallbackRequested = false
+    @State private var isShowingSetupGuide: Bool
+    /// What the Setup Guide asked for; started once its sheet is gone, so
+    /// the two sheets never overlap.
+    @State private var pendingSetupGuideAction: HostSetupGuideAction?
+    /// Stashed while a Host form / Pairing scan sheet dismisses; navigation
+    /// waits for `onDismiss` so the TOFU alert is not suppressed mid-transition
+    /// (#359).
+    @State private var pendingOnboardingHostID: Host.ID?
+    @State private var path: [HostDetailDestination]
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    init(
+        store: HostStore,
+        initialHostID: Host.ID? = nil,
+        showsSetupGuide: Bool = false,
+        connectionStatuses: [Host.ID: EventsSessionStatus] = [:],
+        standingFailures: [Host.ID: TransportError] = [:],
+        latencies: [Host.ID: Duration] = [:],
+        routeIDs: [Host.ID: HostRoute.ID] = [:],
+        syncIssues: [Host.ID: String] = [:],
+        manualReconnectInFlightHostIDs: Set<Host.ID> = [],
+        retryConnection: (@MainActor @Sendable (Host.ID) async -> Void)? = nil,
+        stopConnecting: (@MainActor @Sendable (Host.ID) async -> Void)? = nil,
+        origin: HostListOrigin? = nil,
+        onDone: (@MainActor () -> Void)? = nil
+    ) {
+        self.store = store
+        self.initialHostID = initialHostID
+        _isShowingSetupGuide = State(initialValue: showsSetupGuide)
+        self.connectionStatuses = connectionStatuses
+        self.standingFailures = standingFailures
+        self.latencies = latencies
+        self.routeIDs = routeIDs
+        self.syncIssues = syncIssues
+        self.manualReconnectInFlightHostIDs = manualReconnectInFlightHostIDs
+        self.retryConnection = retryConnection
+        self.stopConnecting = stopConnecting
+        self.origin = origin
+        self.onDone = onDone
+        // On the stack from the first frame, so the requested detail never
+        // renders with the list's back button first.
+        _path = State(initialValue: Self.requestedRoute(initialHostID, in: store).map { [$0] } ?? [])
+        _removal = State(initialValue: HostRemovalStore(store: store))
+        _collapsedGroups = State(initialValue: HostHealthGroup.collapsed(in: .standard))
+    }
+
+    var body: some View {
+        NavigationStack(path: $path) {
+            Group {
+                if store.catalogLoadError != nil {
+                    ContentUnavailableView {
+                        Label("Hosts Unavailable", systemImage: "externaldrive.badge.exclamationmark")
+                    } description: {
+                        Text(
+                            "The saved Host catalog could not be read. Its original data was preserved; "
+                                + "reinstalling or adding a Host would risk losing it.")
+                    }
+                } else if store.hosts.isEmpty {
+                    ContentUnavailableView {
+                        Label("No Hosts", systemImage: "server.rack")
+                    } description: {
+                        Text("Add a machine that runs herdr to get started.")
+                    } actions: {
+                        // Scan to Pair is the primary add-Host action; the
+                        // manual form is the fallback (ADR 0007).
+                        Button("Scan to Pair", systemImage: "qrcode.viewfinder") {
+                            isScanningToPair = true
+                        }
+                        .buttonStyle(.borderedProminent)
+                        Button("Add Manually") { isAddingHost = true }
+                        Button("Setup Guide") { isShowingSetupGuide = true }
+                    }
+                } else {
+                    List {
+                        ForEach(HostListEntry.grouped(entries)) { @Sendable section in
+                            MainActorContent {
+                                let isCollapsed = isCollapsed(section.group)
+                                Section {
+                                    if !isCollapsed {
+                                        ForEach(section.entries) { @Sendable entry in
+                                            MainActorContent { row(for: entry) }
+                                        }
+                                    }
+                                } header: {
+                                    HostGroupHeader(
+                                        group: section.group, count: section.entries.count,
+                                        isCollapsed: isCollapsed
+                                    ) { toggle(section.group) }
+                                }
+                            }
+                        }
+                    }
+                    .scrollContentBackground(.hidden)
+                    .readableColumnPage()
+                }
+            }
+            .ormusCanvas()
+            .navigationTitle("Hosts")
+            .toolbar {
+                if let onDone {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Done", action: onDone)
+                    }
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Scan to Pair", systemImage: "qrcode.viewfinder") {
+                        isScanningToPair = true
+                    }
+                    .disabled(store.catalogLoadError != nil)
+                }
+                ToolbarItem(placement: .primaryAction) {
+                    Button("Add Host", systemImage: "plus") { isAddingHost = true }
+                        .disabled(store.catalogLoadError != nil)
+                }
+            }
+            .navigationDestination(for: HostDetailDestination.self) { route in
+                let id = route.hostID
+                if let host = store.hosts.first(where: { $0.id == id }) {
+                    // Keyed by the Host value: editing recreates the
+                    // onboarding store so checks run against fresh settings.
+                    HostOnboardingView(
+                        host: host,
+                        catalog: store,
+                        connectionStatus: connectionStatuses[id],
+                        standingFailure: standingFailures[id],
+                        connectedRouteID: routeIDs[id],
+                        syncIssue: syncIssues[id],
+                        isManualReconnectInFlight: manualReconnectInFlightHostIDs.contains(id),
+                        retryConnection: retryAction(for: id),
+                        stopConnecting: stopAction(for: id),
+                        dependencies: onboardingDependencies)
+                        .id(host)
+                        .modifier(ReturnToOrigin(origin: route.isRequested ? origin : nil))
+                } else {
+                    ContentUnavailableView("Host removed", systemImage: "server.rack")
+                }
+            }
+            .sheet(
+                isPresented: $isAddingHost,
+                onDismiss: {
+                    navigateToPendingOnboardingHostIfNeeded()
+                }
+            ) {
+                HostFormView(store: store) { saved in
+                    pendingOnboardingHostID = saved.id
+                }
+            }
+            .sheet(
+                isPresented: $isScanningToPair,
+                onDismiss: {
+                    // The scan sheet's "Add Manually" fallback (camera denied
+                    // or unsupported): present the form only once this sheet
+                    // is fully gone, so the two sheets never overlap.
+                    if manualFallbackRequested {
+                        manualFallbackRequested = false
+                        isAddingHost = true
+                        return
+                    }
+                    navigateToPendingOnboardingHostIfNeeded()
+                }
+            ) {
+                // A successful Pairing lands in the same onboarding preflight
+                // a manually added Host enters (session discovery included).
+                PairingScanView(catalog: store) { paired in
+                    pendingOnboardingHostID = paired.id
+                } onAddManually: {
+                    manualFallbackRequested = true
+                }
+            }
+            .sheet(
+                isPresented: $isShowingSetupGuide,
+                onDismiss: {
+                    switch pendingSetupGuideAction {
+                    case .scanToPair: isScanningToPair = true
+                    case .addManually: isAddingHost = true
+                    case nil: break
+                    }
+                    pendingSetupGuideAction = nil
+                }
+            ) {
+                NavigationStack {
+                    HostSetupGuideView { action in
+                        pendingSetupGuideAction = action
+                        isShowingSetupGuide = false
+                    } onClose: {
+                        isShowingSetupGuide = false
+                    }
+                }
+            }
+            .sheet(item: $editingHost) { host in
+                HostFormView(store: store, editing: host)
+            }
+            // A copy is a new Host: like Add, it lands in onboarding, the only
+            // place a first connection to a new endpoint can be trusted.
+            .sheet(
+                item: $duplicateRequest,
+                onDismiss: {
+                    navigateToPendingOnboardingHostIfNeeded()
+                }
+            ) { request in
+                HostFormView(store: store, prefill: request.draft) { saved in
+                    pendingOnboardingHostID = saved.id
+                }
+            }
+            .alert(
+                removal.pendingRequest?.title ?? "Remove Host?",
+                isPresented: removalConfirmationPresented,
+                presenting: removal.pendingRequest
+            ) { request in
+                Button(request.actionTitle, role: .destructive) {
+                    let dependencies = removalDependencies
+                    Task { await removal.confirmRemoval(request, dependencies: dependencies) }
+                }
+                Button("Cancel", role: .cancel) {
+                    removal.cancelRemoval()
+                }
+            } message: { request in
+                Text(request.message)
+            }
+            .sheet(
+                item: sameMachineSheet,
+                onDismiss: {
+                    guard let foldReady else { return }
+                    pendingFold = foldReady
+                    self.foldReady = nil
+                }
+            ) { source in
+                NavigationStack {
+                    SameMachinePicker(
+                        source: source,
+                        others: store.hosts.filter { $0.id != source.id },
+                        isBusy: isCheckingSameMachine
+                    ) { target in
+                        Task { await prepareFold(of: source, into: target) }
+                    }
+                }
+            }
+            .alert(
+                pendingFold.map { "Fold into \($0.targetName)?" } ?? "Fold Hosts?",
+                isPresented: pendingFoldPresented,
+                presenting: pendingFold
+            ) { pending in
+                Button("Fold", role: .destructive) {
+                    let fold = pending
+                    pendingFold = nil
+                    Task { await performFold(fold) }
+                }
+                Button("Cancel", role: .cancel) { pendingFold = nil }
+            } message: { pending in
+                Text(
+                    "\(pending.source.displayName)'s routes join \(pending.targetName). "
+                        + "\(pending.targetName) keeps its account, session, and sign-in. "
+                        + "\(pending.source.displayName) is removed."
+                )
+            }
+            .alert(
+                "Could Not Fold",
+                isPresented: Binding(
+                    get: { sameMachineError != nil },
+                    set: { if !$0 { sameMachineError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { sameMachineError = nil }
+            } message: {
+                Text(sameMachineError ?? "")
+            }
+            .alert(
+                "One Host",
+                isPresented: Binding(
+                    get: { foldNotice != nil },
+                    set: { if !$0 { foldNotice = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) { foldNotice = nil }
+            } message: {
+                Text(foldNotice ?? "")
+            }
+            .alert(
+                "Could Not Remove Host",
+                isPresented: Binding(
+                    get: { removal.errorMessage != nil },
+                    set: { isPresented in
+                        if !isPresented {
+                            removal.dismissError()
+                        }
+                    }
+                )
+            ) {
+                Button("OK", role: .cancel) {
+                    removal.dismissError()
+                }
+            } message: {
+                Text(removal.errorMessage ?? "")
+            }
+            // A caller that keeps this view's identity across requests
+            // still lands on the new one.
+            .onChange(of: initialHostID) { _, id in
+                if let route = Self.requestedRoute(id, in: store) { path = [route] }
+            }
+        }
+        // Covers Host detail too.
+        .readableColumn()
+    }
+
+    private static func requestedRoute(
+        _ id: Host.ID?, in store: HostStore
+    ) -> HostDetailDestination? {
+        guard let id, store.hosts.contains(where: { $0.id == id }) else { return nil }
+        return HostDetailDestination(hostID: id, isRequested: true)
+    }
+
+    private var removalConfirmationPresented: Binding<Bool> {
+        Binding(
+            get: { removal.pendingRequest != nil },
+            set: { if !$0 { removal.cancelRemoval() } })
+    }
+
+    private var entries: [HostListEntry] {
+        store.hosts.map { host in
+            HostListEntry(
+                host: host,
+                presentation: HostRowPresentation(
+                    host: host,
+                    status: connectionStatuses[host.id],
+                    standingFailure: standingFailures[host.id],
+                    latency: latencies[host.id],
+                    syncIssue: syncIssues[host.id],
+                    canRetry: retryConnection != nil))
+        }
+    }
+
+    private func isCollapsed(_ group: HostHealthGroup) -> Bool {
+        collapsedGroups.contains(group)
+    }
+
+    private func toggle(_ group: HostHealthGroup) {
+        withAnimation(reduceMotion ? nil : .snappy) {
+            if !collapsedGroups.insert(group).inserted { collapsedGroups.remove(group) }
+        }
+        HostHealthGroup.save(collapsedGroups, in: .standard)
+    }
+
+    @ViewBuilder
+    private func row(for entry: HostListEntry) -> some View {
+        let host = entry.host
+        let isRetrying =
+            entry.presentation.offersRetry
+            && (entry.presentation.isDialing || manualReconnectInFlightHostIDs.contains(host.id))
+        // Removal can wait on the Host for a few seconds; the row stays put
+        // but inert meanwhile.
+        let isRemoving = removalDependencies.inFlight.contains(host.id)
+        // Every row is a link, so each one gets the chevron, press highlight
+        // and pointer hover; a borderless Retry keeps its own target in it,
+        // and VoiceOver offers it as one of the row's actions.
+        NavigationLink(value: HostDetailDestination(hostID: host.id)) {
+            HStack(spacing: 12) {
+                HostRowLabel(host: host, presentation: entry.presentation)
+                if isRemoving {
+                    ProgressView()
+                        .controlSize(.small)
+                        .accessibilityHidden(true)
+                } else if entry.presentation.offersRetry {
+                    HostRetryButton(isBusy: isRetrying) {
+                        if let retry = retryAction(for: host.id) { Task { await retry() } }
+                    }
+                }
+            }
+        }
+        .disabled(isRemoving)
+        .accessibilityValue(isRemoving ? "Removing" : isRetrying ? "Connecting" : "")
+        .listRowBackground(ListCard.fill)
+        // Every removal asks first. No `.destructive` role: List would
+        // animate the row out while the confirmation is still up.
+        .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+            if !isRemoving {
+                Button {
+                    removal.requestRemoval([host.id], dependencies: removalDependencies)
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+                .tint(.red)
+            }
+        }
+        .contextMenu {
+            Group {
+                Button("Edit", systemImage: "pencil") { editingHost = host }
+                Button("Duplicate", systemImage: "plus.square.on.square") { duplicate(host) }
+                if store.hosts.contains(where: { $0.id != host.id }) {
+                    Button("Same Machine…", systemImage: "link") {
+                        sameMachineSourceID = host.id
+                    }
+                }
+                Button("Remove Host", systemImage: "trash", role: .destructive) {
+                    removal.requestRemoval([host.id], dependencies: removalDependencies)
+                }
+            }
+            .disabled(isRemoving)
+        }
+    }
+
+    /// The Host being folded, read from the catalog so a removal mid-sheet
+    /// drops the picker instead of offering a Host that is already gone.
+    private var sameMachineSheet: Binding<Host?> {
+        Binding(
+            get: {
+                sameMachineSourceID.flatMap { id in store.hosts.first { $0.id == id } }
+            },
+            set: { host in
+                if host == nil, !isCheckingSameMachine {
+                    sameMachineSourceID = nil
+                }
+            })
+    }
+
+    private var pendingFoldPresented: Binding<Bool> {
+        Binding(
+            get: { pendingFold != nil },
+            set: { if !$0 { pendingFold = nil } })
+    }
+
+    @MainActor
+    private func prepareFold(of source: Host, into target: Host) async {
+        guard !isCheckingSameMachine else { return }
+        isCheckingSameMachine = true
+        defer { isCheckingSameMachine = false }
+        let knownHosts = onboardingDependencies.knownHosts
+        let sourceStorage = HostKeyTrust.hostKey(source.id)
+        let targetStorage = HostKeyTrust.hostKey(target.id)
+        let sourceKeys = await knownHosts.fingerprints(
+            host: sourceStorage.host, port: sourceStorage.port)
+        let targetKeys = await knownHosts.fingerprints(
+            host: targetStorage.host, port: targetStorage.port)
+        guard !Task.isCancelled else { return }
+        switch HostMerge.merged(
+            source, into: target, sourceKeys: sourceKeys, targetKeys: targetKeys)
+        {
+        case .failure(let refusal):
+            sameMachineError = refusal.message
+        case .success(let merged):
+            foldReady = PendingHostFold(
+                source: source, merged: merged, targetName: target.displayName)
+            sameMachineSourceID = nil
+        }
+    }
+
+    /// Saves the kept Host first. The spare is removed only after that
+    /// succeeds, through the same cleanup as Remove Host.
+    @MainActor
+    private func performFold(_ pending: PendingHostFold) async {
+        do {
+            try store.update(pending.merged)
+        } catch {
+            sameMachineError = "The routes could not be saved, so nothing was folded."
+            return
+        }
+        let source = pending.source
+        let keyed = removalDependencies.hasNotificationKey(source.id)
+        let request = HostRemovalRequest(
+            hosts: [source],
+            deletesNotificationKey: keyed,
+            leavesNotificationsBehind: keyed && !removalDependencies.isConnected(source.id))
+        await removal.confirmRemoval(request, dependencies: removalDependencies)
+        if removal.errorMessage == nil {
+            foldNotice = "\(source.displayName) was folded into \(pending.targetName)."
+        }
+    }
+
+    private func duplicate(_ host: Host) {
+        // An unreadable password only costs the prefill: the form then
+        // requires one before saving.
+        let password = host.authMethod == .password ? try? store.password(for: host) : nil
+        duplicateRequest = HostDuplicateRequest(
+            draft: HostDraft(
+                duplicating: host,
+                password: password,
+                existingNames: store.hosts.map(\.displayName)))
+    }
+
+    private func navigateToPendingOnboardingHostIfNeeded() {
+        guard let id = pendingOnboardingHostID else { return }
+        pendingOnboardingHostID = nil
+        path.append(HostDetailDestination(hostID: id))
+    }
+
+    private func retryAction(
+        for id: Host.ID
+    ) -> (@MainActor @Sendable () async -> Void)? {
+        guard let retryConnection else { return nil }
+        return { await retryConnection(id) }
+    }
+
+    private func stopAction(
+        for id: Host.ID
+    ) -> (@MainActor @Sendable () async -> Void)? {
+        guard let stopConnecting else { return nil }
+        return { await stopConnecting(id) }
+    }
+}
+
+/// One pushed Host detail. The one opened on request is marked in the route
+/// itself, not inferred from where it sits on the stack, so its detail knows
+/// where Back goes from its first render.
+private struct HostDetailDestination: Hashable {
+    let hostID: Host.ID
+    var isRequested = false
+}
+
+/// The screen that opened a Host's detail from outside the Hosts list.
+struct HostListOrigin {
+    /// Names the destination, e.g. "Agents".
+    let title: String
+    let goBack: () -> Void
+}
+
+/// Swaps the back button for one that returns to `origin`, so opening a Host
+/// from somewhere else and backing out lands where the user started.
+private struct ReturnToOrigin: ViewModifier {
+    let origin: HostListOrigin?
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+
+    func body(content: Content) -> some View {
+        if let origin {
+            content
+                .navigationBarBackButtonHidden(true)
+                .toolbar {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button(action: origin.goBack) {
+                            // It leaves the tab, so on the iPad it names
+                            // where to, as "< Agents"; iPhone back buttons
+                            // are a bare chevron. Not a Label: the bar
+                            // shows a Label's icon alone.
+                            HStack(spacing: 4) {
+                                Image(systemName: "chevron.backward")
+                                if horizontalSizeClass == .regular {
+                                    Text(origin.title)
+                                }
+                            }
+                        }
+                        .accessibilityLabel("Back to \(origin.title)")
+                    }
+                }
+        } else {
+            content
+        }
+    }
+}
+
+/// The Hosts list's groups (#316), by what each Host needs from the user and
+/// in that order: a stopped Host first, next to its Retry.
+enum HostHealthGroup: Int, CaseIterable, Comparable {
+    case cannotConnect
+    case trying
+    case connected
+    /// Paused while the app is in the background, or retired.
+    case notConnected
+
+    var title: String {
+        switch self {
+        case .cannotConnect: "Can't Connect"
+        case .trying: "Trying"
+        case .connected: "Connected"
+        case .notConnected: "Not Connected"
+        }
+    }
+
+    static func < (lhs: Self, rhs: Self) -> Bool { lhs.rawValue < rhs.rawValue }
+
+    private static let collapsedKey = "host-list.collapsed-groups"
+
+    static func collapsed(in defaults: UserDefaults) -> Set<Self> {
+        Set((defaults.array(forKey: collapsedKey) as? [Int] ?? []).compactMap(Self.init(rawValue:)))
+    }
+
+    static func save(_ collapsed: Set<Self>, in defaults: UserDefaults) {
+        defaults.set(collapsed.map(\.rawValue).sorted(), forKey: collapsedKey)
+    }
+}
+
+/// One Host on the Hosts list, with how its row reads.
+struct HostListEntry: Identifiable, Equatable {
+    let host: Host
+    let presentation: HostRowPresentation
+
+    var id: Host.ID { host.id }
+
+    struct Section: Identifiable, Equatable {
+        let group: HostHealthGroup
+        let entries: [HostListEntry]
+
+        var id: HostHealthGroup { group }
+    }
+
+    /// Non-empty groups in `HostHealthGroup` order, catalog order within.
+    static func grouped(_ entries: [HostListEntry]) -> [Section] {
+        HostHealthGroup.allCases.compactMap { group in
+            let members = entries.filter { $0.presentation.group == group }
+            return members.isEmpty ? nil : Section(group: group, entries: members)
+        }
+    }
+}
+
+/// A group's header: its name and count, collapsing the group on tap.
+private struct HostGroupHeader: View {
+    let group: HostHealthGroup
+    let count: Int
+    let isCollapsed: Bool
+    let onToggle: () -> Void
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 6) {
+                Text(group.title)
+                Text(count, format: .number)
+                    .foregroundStyle(.tertiary)
+                Spacer(minLength: 0)
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .rotationEffect(.degrees(isCollapsed ? 0 : 90))
+                    .frame(width: 12)
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("\(group.title), \(count) \(count == 1 ? "Host" : "Hosts")")
+        .accessibilityValue(isCollapsed ? "Collapsed" : "Expanded")
+        .accessibilityHint(isCollapsed ? "Shows these Hosts." : "Hides these Hosts.")
+        .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// One Hosts list row. A problem is named by its Summary alone; Host
+/// detail, a tap away, shows the whole Transport Error Presentation.
+struct HostRowPresentation: Equatable {
+    let group: HostHealthGroup
+    let tone: HostConnectionTone
+    /// Under the name: the address while connected and in sync, otherwise
+    /// the state.
+    let detail: String
+    /// A stopped Host's reason reads in red.
+    let isProblem: Bool
+    /// Latency while connected.
+    let trailing: String?
+    let offersRetry: Bool
+    /// The user's own retry is dialing: the row stays in Can't Connect with
+    /// its button busy, rather than jumping away under the finger.
+    let isDialing: Bool
+
+    init(
+        host: Host,
+        status: EventsSessionStatus?,
+        standingFailure: TransportError?,
+        latency: Duration?,
+        syncIssue: String? = nil,
+        canRetry: Bool = true
+    ) {
+        let problem = HostConnectionDetailPresentation(
+            host: host, status: status, standingFailure: standingFailure)
+        let chip = HostConnectionPresentation(
+            status: status, standingFailure: standingFailure, latency: latency)
+        // Connected but out of sync wears the Console's "Sync issue" look;
+        // the projection only reports a sync error while connected.
+        let isOutOfSync = if case .connected = status { syncIssue != nil } else { false }
+        tone = isOutOfSync ? .warning : problem?.tone ?? chip.tone
+        isDialing = problem?.isDialing ?? false
+        trailing = if case .connected = status { chip.title } else { nil }
+        switch status {
+        case .failed:
+            group = .cannotConnect
+            detail = problem?.summary ?? chip.title
+            isProblem = true
+            offersRetry = canRetry
+        case .connecting where problem != nil:
+            group = .cannotConnect
+            detail = problem?.summary ?? chip.title
+            isProblem = false
+            offersRetry = canRetry
+        case .reconnecting:
+            group = .trying
+            detail = [problem?.summary, problem?.attempt].compactMap { $0 }.joined(separator: " · ")
+            isProblem = false
+            offersRetry = false
+        case .connecting, nil:
+            group = .trying
+            detail = chip.title
+            isProblem = false
+            offersRetry = false
+        case .connected:
+            group = .connected
+            var address = host.connectionSummary
+            if let endpoint = host.herdrEndpoint {
+                if !endpoint.session.isEmpty { address += " · session \(endpoint.session)" }
+            } else if case .namedSession(let session) = host.socketLocation {
+                address += " · session \(session)"
+            }
+            // The reason itself is in Host detail, a tap away.
+            detail = isOutOfSync ? "Sync issue" : address
+            isProblem = false
+            offersRetry = false
+        case .suspended, .ended:
+            group = .notConnected
+            detail = chip.title
+            isProblem = false
+            offersRetry = false
+        }
+    }
+}
+
+private struct HostRowLabel: View {
+    let host: Host
+    let presentation: HostRowPresentation
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HostStatusGlyph(tone: presentation.tone)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(host.displayName)
+                    .font(.headline)
+                    .lineLimit(1)
+                Text(presentation.detail)
+                    .font(.subheadline)
+                    .foregroundStyle(presentation.isProblem ? Color.red : Color.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 0)
+            if let trailing = presentation.trailing {
+                Text(trailing)
+                    .font(.subheadline)
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 2)
+        .accessibilityElement(children: .combine)
+    }
+}
+
+/// Retry on a stopped Host's row: the same Reconnect Request as Host
+/// detail's button, busy while it dials.
+private struct HostRetryButton: View {
+    let isBusy: Bool
+    let action: () -> Void
+
+    /// The disc grows with the glyph, which follows Dynamic Type.
+    @ScaledMetric(relativeTo: .subheadline) private var discSize: CGFloat = 30
+
+    var body: some View {
+        // Inert while busy but still hit: a tap on the spinner must not fall
+        // through to the row's link and open the Host.
+        Button { if !isBusy { action() } } label: {
+            // Hidden, not removed, while busy: the button keeps its size.
+            // Small and light: a stopped Host's reason is the row's point,
+            // and three prominent buttons in a row shout over it.
+            Image(systemName: "arrow.clockwise")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(Self.glyph)
+                .opacity(isBusy ? 0 : 1)
+                .overlay {
+                    if isBusy { ProgressView().controlSize(.small) }
+                }
+                .frame(width: discSize, height: discSize)
+                // Gray on gray: the stopped Host's red reason stays the one
+                // color in the row.
+                .background(Self.disc, in: Circle())
+                // The full 44-point target around the smaller circle.
+                .frame(width: max(44, discSize), height: max(44, discSize))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.borderless)
+        .accessibilityLabel("Retry")
+        // The row says "Connecting" instead of offering an action that
+        // would do nothing.
+        .accessibilityHidden(isBusy)
+    }
+
+    // On the light card the dark palette's pairing reads as disabled: the
+    // disc is too heavy and the glyph too faint on it. Light mode lightens
+    // the disc and darkens the glyph.
+    private static let glyph = Color(uiColor: UIColor {
+        $0.userInterfaceStyle == .dark ? .secondaryLabel : UIColor.label.withAlphaComponent(0.6)
+    })
+    private static let disc = Color(uiColor: UIColor {
+        $0.userInterfaceStyle == .dark ? .tertiarySystemFill : .quaternarySystemFill
+    })
+}
+
+/// A Host's connection state in a word or two: a connected Host's latency,
+/// or the state `HostRowPresentation` falls back on when there is no
+/// problem to name. It renders Host Connection Status, never a Transport
+/// Error Presentation.
+struct HostConnectionPresentation: Equatable {
+    let title: String
+    let accessibilityLabel: String
+    let tone: HostConnectionTone
+
+    init(
+        status: EventsSessionStatus?,
+        standingFailure: TransportError? = nil,
+        latency: Duration?
+    ) {
+        switch status {
+        case .connected:
+            if let latency {
+                let formattedLatency = HostLatencyFormatting.formatted(latency)
+                title = formattedLatency
+                accessibilityLabel = "Connected, latency \(formattedLatency)"
+            } else {
+                title = "Measuring…"
+                accessibilityLabel = "Connected, measuring latency"
+            }
+            tone = .connected
+        case .reconnecting:
+            title = "Reconnecting…"
+            accessibilityLabel = "Reconnecting"
+            tone = .reconnecting
+        case .connecting:
+            if standingFailure != nil {
+                title = "Unavailable"
+                accessibilityLabel = "Unavailable"
+                tone = .unavailable
+            } else {
+                title = "Connecting…"
+                accessibilityLabel = "Connecting"
+                tone = .pending
+            }
+        case .failed, .ended:
+            title = "Unavailable"
+            accessibilityLabel = "Unavailable"
+            tone = .unavailable
+        case .suspended:
+            title = "Paused"
+            accessibilityLabel = "Connection paused"
+            tone = .paused
+        case nil:
+            title = "Connecting…"
+            accessibilityLabel = "Connecting"
+            tone = .pending
+        }
+    }
+}
+
+#Preview {
+    HostListView(store: HostStore(secrets: PreviewSecretStore()))
+}
+
+/// Keeps previews out of the real Keychain.
+private final class PreviewSecretStore: SecretStore {
+    func read(account: String) throws -> Data? { nil }
+    func readAll() throws -> [String: Data] { [:] }
+    func write(_ secret: Data, account: String) throws {}
+    func removeSecret(account: String) throws {}
+}

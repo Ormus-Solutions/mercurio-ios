@@ -1,0 +1,1081 @@
+import Foundation
+
+@testable import Mercurio
+
+/// Scripted `Transport` for Console and EventsSession protocol-level tests:
+/// the test scripts the snapshot and pane text, and drives the event stream
+/// by hand. No SSH anywhere.
+final actor ScriptedTransport: Transport {
+    private(set) var isClosed = false
+    /// Liveness is scripted separately from `close()`, so a test can model a
+    /// degraded connection (dead link, live events reader) before the session
+    /// decides to replace the transport.
+    private var connectionAlive = true
+    /// Every subscription set received, in order; the Console's
+    /// resubscribe-on-membership-change behavior asserts on this.
+    private(set) var capturedSubscriptions: [[EventSubscription]] = []
+    private(set) var paneReadParams: [PaneReadParams] = []
+    private var chatFiles: ChatHostFiles?
+    private var chatAgent: Agent?
+    private(set) var chatAgentReads: [AgentTarget] = []
+
+    func scriptChat(files: ChatHostFiles, agent: Agent) {
+        chatFiles = files
+        chatAgent = agent
+    }
+
+    func agentInfo(_ target: AgentTarget) async throws -> Agent {
+        chatAgentReads.append(target)
+        guard let chatAgent, chatAgent.paneID == target.target else {
+            throw TransportError.hostFeatureUnavailable(feature: "Chat")
+        }
+        return chatAgent
+    }
+
+    func hostHomeDirectory() async throws -> String {
+        guard let chatFiles else { throw TransportError.hostFeatureUnavailable(feature: "Chat") }
+        return try await chatFiles.home()
+    }
+
+    func fileStatus(atPath path: String) async throws -> RemoteFileStatus? {
+        guard let chatFiles else { throw TransportError.hostFeatureUnavailable(feature: "Chat") }
+        return try await chatFiles.status(path)
+    }
+
+    func listFiles(_ request: RemoteFileListingRequest) async throws -> RemoteFileListing? {
+        guard let chatFiles else { throw TransportError.hostFeatureUnavailable(feature: "Chat") }
+        return try await chatFiles.list(request)
+    }
+
+    func readHostFileRange(_ range: RemoteFileRange) async throws -> RemoteFileSlice {
+        guard let chatFiles else { throw TransportError.hostFeatureUnavailable(feature: "Chat") }
+        return try await chatFiles.read(range)
+    }
+    private(set) var agentPromptParams: [AgentPromptParams] = []
+    /// Every `agent.start` received, in order; the new-agent flow (#12)
+    /// asserts on the params it forwarded.
+    private(set) var agentStarts: [AgentLaunchRequest] = []
+    private(set) var shellTerminalCreations: [ShellTerminalCreationRequest] = []
+    /// Every worktree launch received, in order; the new-worktree flow (#97)
+    /// asserts on the request/spec pairs it forwarded.
+    private(set) var worktreeStarts: [(request: AgentLaunchRequest, worktree: WorktreeSpec)] = []
+    /// Every new-Workspace launch received, in order; the new-Workspace flow
+    /// (#230) asserts on the request/spec pairs it forwarded.
+    private(set) var workspaceStarts: [(request: AgentLaunchRequest, workspace: NewWorkspaceSpec)] =
+        []
+    private(set) var agentDiscoveryCount = 0
+    private var availableKinds = SupportedAgentKind.allCases
+    private var agentDiscoveryFailure: TransportError?
+    /// Every `pane.close` received, in order; the close-pane flow (#13)
+    /// asserts on the pane it targeted (and that the cancel path never
+    /// appends here).
+    private(set) var closedPanes: [PaneTarget] = []
+    private(set) var closedTabs: [TabTarget] = []
+    private var closeFailure: TransportError?
+    private(set) var listedWorktreeWorkspaceIDs: [String] = []
+    private(set) var removedWorktreeRequests: [WorktreeRemovalRequest] = []
+    private var worktreeListResponse: WorktreeListResponse?
+    private var worktreeListFailure: (any Error)?
+    private var worktreeRemoveFailure: (any Error)?
+    private var worktreeRemoveResponsePath: String?
+    private var nextWorktreeAuthorizationGate: ScriptedTransportCallGate?
+    private(set) var agentFocuses: [AgentTarget] = []
+    private var focusFailure: TransportError?
+    /// Every `agent.rename` / `workspace.rename` received, in order; the
+    /// rename flows (#98) assert on the params they forwarded.
+    private(set) var agentRenames: [AgentRenameParams] = []
+    private(set) var workspaceRenames: [WorkspaceRenameParams] = []
+    private var renameFailure: TransportError?
+    private var startFailure: TransportError?
+    private var startedAgent: AgentInfo?
+    private var shellTerminalIdentity = ShellTerminalIdentity(
+        paneID: "w1:p-shell",
+        tabID: "w1:t-shell",
+        terminalID: "term-shell")
+    private var shellTerminalCreationFailure: (any Error)?
+    private var nextShellTerminalCreationGate: ScriptedTransportCallGate?
+    private(set) var snapshotFetchCount = 0
+    /// Records acknowledgement readiness at each snapshot's request boundary.
+    private(set) var snapshotHadLiveSubscription: [Bool] = []
+    /// Every attach request received, in order; the Attach store's
+    /// open-once behavior asserts on this.
+    private(set) var attachRequests: [TerminalAttachRequest] = []
+    /// Everything sent down the live attach session, in order — keystrokes
+    /// and resizes interleaved exactly as the store issued them.
+    private(set) var attachInputs: [TerminalAttachInput] = []
+
+    /// Every `ping` received, in order of arrival; the keepalive tests assert
+    /// on how many the idle loop generated.
+    private(set) var pingCount = 0
+    private var pingFailures: [Int: TransportError] = [:]
+    private var pingGate: ScriptedTransportCallGate?
+    private var closeGate: ScriptedTransportCallGate?
+
+    private var serverInfo: ServerInfo
+    private var snapshot: SessionSnapshot
+    private var snapshotFailure: TransportError?
+    private var nextSnapshotGate: ScriptedTransportCallGate?
+    private var paneTexts: [String: String] = [:]
+    private var paneReadFailure: TransportError?
+    private var nextPaneReadGate: ScriptedTransportCallGate?
+    private var agentPromptFailure: (any Error)?
+    private var agentPromptFailures: [any Error] = []
+    private var nextAgentPromptGate: ScriptedTransportCallGate?
+    private var missingPaneIDs: Set<String> = []
+    private var nextStreamID: UInt64 = 0
+    private var liveStreamID: UInt64?
+    private var eventContinuation: AsyncThrowingStream<HerdrEvent, any Error>.Continuation?
+    private var subscriptionObservers: [UUID: AsyncStream<[EventSubscription]>.Continuation] = [:]
+    private var nextSubscriptionGate: ScriptedTransportCallGate?
+    private var nextAttachID: UInt64 = 0
+    private var liveAttachID: UInt64?
+    private var nextAttachGate: ScriptedTransportCallGate?
+    private var nextAttachSessionGate: ScriptedTransportCallGate?
+    private var attachContinuation: AsyncThrowingStream<Data, any Error>.Continuation?
+    private var attachInputTask: Task<Void, Never>?
+    private var nextAttachEndGate: ScriptedTransportCallGate?
+    private(set) var stageRequests: [PreparedImage] = []
+    private var stageOutcomes: [Result<StagedImage, AttachmentStagingError>] = []
+    private var stageGate: ScriptedTransportCallGate?
+    private(set) var fileStageRequests: [PreparedFile] = []
+    private var fileStageOutcomes: [Result<StagedFile, AttachmentStagingError>] = []
+    private var fileStageGate: ScriptedTransportCallGate?
+    /// The Host's current Notification Registration file bytes; nil scripts
+    /// "no device registered yet".
+    private(set) var notificationRegistration: Data?
+    /// Every whole-file replace received, in order; the ceremony tests
+    /// assert on what would have landed on the Host.
+    private(set) var replacedNotificationRegistrations: [Data] = []
+    private(set) var notificationRegistrationReads = 0
+    private var notificationRegistrationReadFailure: NotificationRegistrationError?
+    private var notificationRegistrationWriteFailure: NotificationRegistrationError?
+    private var notificationRegistrationWriteFailsAfterLanding = false
+    private var notificationRegistrationWriteGate: CancellablePhaseGate?
+    private(set) var notificationRegistrationWriteIsBlocked = false
+    /// The Host's current `notify.json` bytes; nil scripts "no config yet".
+    /// The relay-URL write path (#76) asserts on what the ceremony merged in.
+    private(set) var notificationConfig: Data?
+    /// Every `notify.json` replace received, in order.
+    private(set) var replacedNotificationConfigs: [Data] = []
+    private(set) var notificationConfigReads = 0
+    /// The Host's current `sidebar.json` bytes; nil scripts "no snapshot yet"
+    /// so layout precedence can fall through.
+    private(set) var sidebarLayout: Data?
+    private(set) var sidebarLayoutReads = 0
+    private var nextSidebarLayoutGate: ScriptedTransportCallGate?
+    private var sidebarLayoutReadFailure: (any Error)?
+    /// The Host's `plugin.list` answer for the Mercurio plugin; nil scripts
+    /// "not installed".
+    private var heelerPlugin: Result<HeelerPluginInstallation?, any Error> = .success(nil)
+    private(set) var heelerPluginReads = 0
+    private var nextHeelerPluginGate: ScriptedTransportCallGate?
+    /// Every untracked-directory listing received, in order.
+    private(set) var untrackedDirectoryRequests: [UntrackedDirectoryRequest] = []
+    /// Consumed one per listing; an unscripted listing reports Changes as
+    /// unavailable, like a Transport without git.
+    private var untrackedDirectoryOutcomes: [Result<UntrackedDirectoryListing, any Error>] = []
+    private var nextUntrackedDirectoryGate: ScriptedTransportCallGate?
+    /// Every Changes read received, in order.
+    private(set) var changesReadRequests: [ChangesReadRequest] = []
+    /// Consumed one per read; an unscripted read reports Changes as
+    /// unavailable, like a Transport without git.
+    private var changesReadOutcomes: [Result<CheckoutChangesRead, any Error>] = []
+    private var nextChangesReadGate: ScriptedTransportCallGate?
+
+    /// Every lazy file-patch read received, in order.
+    private(set) var filePatchRequests: [FilePatchRequest] = []
+    private var filePatchReadOutcomes: [Result<FilePatch, any Error>] = []
+    private var nextFilePatchReadGate: ScriptedTransportCallGate?
+
+    /// The catalog route this fake reports reaching (ADR 0022).
+    nonisolated let routeID: UUID?
+
+    init(
+        snapshot: SessionSnapshot = .fixture(),
+        serverInfo: ServerInfo = ServerInfo(version: "0.7.5-fake", protocolVersion: 17),
+        routeID: UUID? = nil
+    ) {
+        self.snapshot = snapshot
+        self.serverInfo = serverInfo
+        self.routeID = routeID
+    }
+
+    // MARK: Scripting
+
+    /// Replaces the snapshot subsequent `sessionSnapshot()` calls return.
+    func setSnapshot(_ snapshot: SessionSnapshot) {
+        self.snapshot = snapshot
+    }
+
+    /// Makes every subsequent `sessionSnapshot` throw `failure`.
+    func setSnapshotFailure(_ failure: TransportError?) {
+        snapshotFailure = failure
+    }
+
+    /// Pauses the next snapshot after capturing its response, so tests can
+    /// deterministically deliver events while that stale response is in flight.
+    func gateNextSnapshot(using gate: ScriptedTransportCallGate) {
+        nextSnapshotGate = gate
+    }
+
+    /// Scripts the text `readPane` returns for `paneID`.
+    func setPaneText(_ text: String, paneID: String) {
+        paneTexts[paneID] = text
+    }
+
+    /// Makes every subsequent `readPane` throw `failure`.
+    func setPaneReadFailure(_ failure: TransportError?) {
+        paneReadFailure = failure
+    }
+
+    /// Pauses the next pane read after capturing its response.
+    func gateNextPaneRead(using gate: ScriptedTransportCallGate) {
+        nextPaneReadGate = gate
+    }
+
+    /// Makes every subsequent `promptAgent` throw `failure`.
+    func setAgentPromptFailure(_ failure: (any Error)?) {
+        agentPromptFailure = failure
+    }
+
+    /// Scripts one-shot `promptAgent` failures consumed in order, one per
+    /// call, before any persistent failure applies: a call whose queue is
+    /// non-empty throws the head and the rest stays queued. Lets a test
+    /// model herdr refusing the first prompts of a booting agent and then
+    /// accepting.
+    func setAgentPromptFailures(_ failures: [any Error]) {
+        agentPromptFailures = failures
+    }
+
+    /// Pauses the next Agent prompt after recording its params.
+    func gateNextAgentPrompt(using gate: ScriptedTransportCallGate) {
+        nextAgentPromptGate = gate
+    }
+
+    /// Scripts the `AgentInfo` `startAgent` returns; without it the fake
+    /// synthesizes a Working agent from the start params.
+    func setStartedAgent(_ agent: AgentInfo) {
+        startedAgent = agent
+    }
+
+    /// Makes every subsequent `startAgent` throw `failure`.
+    func setStartFailure(_ failure: TransportError?) {
+        startFailure = failure
+    }
+
+    func configureShellTerminalCreation(
+        identity: ShellTerminalIdentity = ShellTerminalIdentity(
+            paneID: "w1:p-shell",
+            tabID: "w1:t-shell",
+            terminalID: "term-shell"),
+        failure: (any Error)? = nil,
+        gate: ScriptedTransportCallGate? = nil
+    ) {
+        shellTerminalIdentity = identity
+        shellTerminalCreationFailure = failure
+        nextShellTerminalCreationGate = gate
+    }
+
+    func setAvailableAgentKinds(
+        _ kinds: [SupportedAgentKind],
+        failure: TransportError? = nil
+    ) {
+        availableKinds = kinds
+        agentDiscoveryFailure = failure
+    }
+
+    /// Makes every subsequent `closePane` throw `failure`.
+    func setCloseFailure(_ failure: TransportError?) {
+        closeFailure = failure
+    }
+
+    func configureWorktreeList(
+        _ response: WorktreeListResponse?, failure: (any Error)? = nil
+    ) {
+        worktreeListResponse = response
+        worktreeListFailure = failure
+    }
+
+    func setWorktreeRemoveFailure(_ failure: (any Error)?) {
+        worktreeRemoveFailure = failure
+    }
+
+    func setWorktreeRemoveResponsePath(_ path: String?) {
+        worktreeRemoveResponsePath = path
+    }
+
+    func gateNextWorktreeAuthorization(using gate: ScriptedTransportCallGate) {
+        nextWorktreeAuthorizationGate = gate
+    }
+
+    /// Makes every subsequent rename (agent or workspace) throw `failure`.
+    func setFocusFailure(_ failure: TransportError?) {
+        focusFailure = failure
+    }
+
+    func setRenameFailure(_ failure: TransportError?) {
+        renameFailure = failure
+    }
+
+    func configureImageStaging(
+        outcomes: [Result<StagedImage, AttachmentStagingError>],
+        gate: ScriptedTransportCallGate? = nil
+    ) {
+        stageOutcomes = outcomes
+        stageGate = gate
+    }
+
+    func configureFileStaging(
+        outcomes: [Result<StagedFile, AttachmentStagingError>],
+        gate: ScriptedTransportCallGate? = nil
+    ) {
+        fileStageOutcomes = outcomes
+        fileStageGate = gate
+    }
+
+    func gateNextAttachEnd(on gate: ScriptedTransportCallGate) {
+        nextAttachEndGate = gate
+    }
+
+    /// Pauses the next events subscription after recording its requested set.
+    func gateNextSubscription(using gate: ScriptedTransportCallGate) {
+        nextSubscriptionGate = gate
+    }
+
+    /// Wait for actual stream installation, not merely a captured request.
+    /// AsyncStream cancellation ends the wait if the test is canceled.
+    func waitForLiveSubscription(containing expected: [EventSubscription]) async throws {
+        if liveStreamID != nil, let current = capturedSubscriptions.last,
+            expected.allSatisfy(current.contains)
+        { return }
+        let id = UUID()
+        let updates = AsyncStream<[EventSubscription]>.makeStream()
+        subscriptionObservers[id] = updates.continuation
+        defer {
+            subscriptionObservers[id] = nil
+            updates.continuation.finish()
+        }
+        for await current in updates.stream {
+            if expected.allSatisfy(current.contains) { return }
+        }
+        throw CancellationError()
+    }
+
+    /// Pushes one event onto the live stream; false if none is live.
+    @discardableResult
+    func emit(_ event: HerdrEvent) -> Bool {
+        guard let eventContinuation else { return false }
+        eventContinuation.yield(event)
+        return true
+    }
+
+    /// Kills the live stream with `failure`, as a remotely dropped events
+    /// channel would.
+    func failEventStream(_ failure: TransportError) {
+        eventContinuation?.finish(throwing: failure)
+        eventContinuation = nil
+        liveStreamID = nil
+    }
+
+    /// Pushes raw PTY bytes onto the live attach session; false if none is
+    /// live.
+    @discardableResult
+    func emitAttachOutput(_ bytes: Data) -> Bool {
+        guard let attachContinuation else { return false }
+        attachContinuation.yield(bytes)
+        return true
+    }
+
+    /// Ends the live attach session gracefully, as the remote attach exiting
+    /// cleanly (the user detached inside the TUI) would.
+    func endAttachFromRemote() {
+        attachContinuation?.finish()
+        attachContinuation = nil
+        liveAttachID = nil
+    }
+
+    /// Kills the live attach session with `failure`, as a remotely dropped
+    /// terminal channel would.
+    func failAttachStream(_ failure: TransportError) {
+        attachContinuation?.finish(throwing: failure)
+        attachContinuation = nil
+        liveAttachID = nil
+    }
+
+    /// Whether an attach session is currently live.
+    var hasLiveAttachSession: Bool {
+        attachContinuation != nil
+    }
+
+    /// Scripts the registration file the Host currently holds.
+    func setNotificationRegistration(_ data: Data?) {
+        notificationRegistration = data
+    }
+
+    /// Makes every subsequent registration read throw `failure`.
+    func setNotificationRegistrationReadFailure(_ failure: NotificationRegistrationError?) {
+        notificationRegistrationReadFailure = failure
+    }
+
+    /// Makes every subsequent registration replace throw `failure`.
+    func setNotificationRegistrationWriteFailure(_ failure: NotificationRegistrationError?) {
+        notificationRegistrationWriteFailure = failure
+        notificationRegistrationWriteFailsAfterLanding = false
+    }
+
+    /// Makes every subsequent registration replace land on the Host and then
+    /// throw `failure`, like a write whose exit status is lost after the
+    /// atomic rename. Pass nil to restore normal writes.
+    func setNotificationRegistrationWriteFailsAfterLanding(_ failure: NotificationRegistrationError?) {
+        notificationRegistrationWriteFailure = failure
+        notificationRegistrationWriteFailsAfterLanding = failure != nil
+    }
+
+    func holdNotificationRegistrationWrites(on gate: CancellablePhaseGate) {
+        notificationRegistrationWriteGate = gate
+    }
+
+    /// Scripts the `notify.json` config the Host currently holds.
+    func setNotificationConfig(_ data: Data?) {
+        notificationConfig = data
+    }
+
+    /// Scripts the `sidebar.json` snapshot the Host currently holds.
+    func setSidebarLayout(_ data: Data?) {
+        sidebarLayout = data
+    }
+
+    /// Makes every subsequent sidebar layout read throw `failure`.
+    func setSidebarLayoutReadFailure(_ failure: (any Error)?) {
+        sidebarLayoutReadFailure = failure
+    }
+
+    /// Scripts what every subsequent Mercurio plugin read answers.
+    func setHeelerPlugin(_ result: Result<HeelerPluginInstallation?, any Error>) {
+        heelerPlugin = result
+    }
+
+    func gateNextHeelerPluginRead(_ gate: ScriptedTransportCallGate) {
+        nextHeelerPluginGate = gate
+    }
+
+    func readHeelerPlugin() async throws -> HeelerPluginInstallation? {
+        heelerPluginReads += 1
+        let result = heelerPlugin
+        let gate = nextHeelerPluginGate
+        nextHeelerPluginGate = nil
+        if let gate { await gate.waitUntilOpen() }
+        return try result.get()
+    }
+
+    /// Makes the `ordinal`-th `ping` on this transport throw `failure`. A real
+    /// Transport turns a request the connection never answers into
+    /// `.timedOut` at its deadline, so scripting that outcome exercises the
+    /// same seam the session sees without putting a test on the clock.
+    func failPing(atCall ordinal: Int, with failure: TransportError) {
+        pingFailures[ordinal] = failure
+    }
+
+    /// Parks the next `ping` on `gate`, after counting it, so a test can hold
+    /// one Host's liveness proof in flight while inspecting another's.
+    func gateNextPing(using gate: ScriptedTransportCallGate) {
+        pingGate = gate
+    }
+
+    /// Parks the next `close()` on `gate` — which records the entry before
+    /// waiting — so a test can pin a session teardown mid-flight.
+    func gateNextClose(using gate: ScriptedTransportCallGate) {
+        closeGate = gate
+    }
+
+    /// Parks the next terminal open after recording its request. Tests use the
+    /// gate's entry edge as a deterministic proof that Attach startup began.
+    func gateNextAttach(using gate: ScriptedTransportCallGate) {
+        nextAttachGate = gate
+    }
+
+    /// Parks the next terminal open after its session exists but before the
+    /// caller receives it. This lets tests drive buffered output without
+    /// polling for actor scheduling.
+    func gateNextAttachSession(using gate: ScriptedTransportCallGate) {
+        nextAttachSessionGate = gate
+    }
+
+    /// Scripts panes that no longer exist on the Host. herdr fails an entire
+    /// `events.subscribe` when one pane-scoped entry names a pane that has
+    /// exited (verified against a live 0.7.5 server), so the fake rejects the
+    /// same way instead of quietly skipping the entry.
+    func setMissingPanes(_ paneIDs: Set<String>) {
+        missingPaneIDs = paneIDs
+    }
+
+    // MARK: Transport
+
+    func ping() async throws -> ServerInfo {
+        // A real Transport's ping fails on a link its events reader has not
+        // reported dead yet; the scripted one must too, or callers that race
+        // a replacement see a phantom success from the transport that is
+        // about to be replaced.
+        guard connectionAlive else {
+            throw TransportError.sshUnreachable(detail: "connection is dead")
+        }
+        pingCount += 1
+        let failure = pingFailures[pingCount]
+        let gate = pingGate
+        pingGate = nil
+        await gate?.waitUntilOpen()
+        if let failure { throw failure }
+        return serverInfo
+    }
+
+    func listAgents() async throws -> [Agent] {
+        snapshot.agents.map(Agent.init)
+    }
+
+    func availableAgentKinds() async throws -> [SupportedAgentKind] {
+        agentDiscoveryCount += 1
+        if let agentDiscoveryFailure { throw agentDiscoveryFailure }
+        return availableKinds
+    }
+
+    func sessionSnapshot() async throws -> SessionSnapshot {
+        snapshotFetchCount += 1
+        snapshotHadLiveSubscription.append(liveStreamID != nil)
+        let response = snapshot
+        let failure = snapshotFailure
+        let gate = nextSnapshotGate
+        nextSnapshotGate = nil
+        await gate?.waitUntilOpen()
+        if let failure { throw failure }
+        return response
+    }
+
+    func readPane(_ params: PaneReadParams) async throws -> PaneReadResult {
+        paneReadParams.append(params)
+        let responseText = paneTexts[params.paneID] ?? ""
+        let failure = paneReadFailure
+        let gate = nextPaneReadGate
+        nextPaneReadGate = nil
+        await gate?.waitUntilOpen()
+        if let failure { throw failure }
+        return PaneReadResult(
+            format: .text, paneID: params.paneID, revision: 0,
+            source: params.source, tabID: "t", text: responseText,
+            truncated: false, workspaceID: "w")
+    }
+
+    func readAgent(_ params: AgentReadParams) async throws -> PaneReadResult {
+        return PaneReadResult(
+            format: params.format ?? .text, paneID: params.target, revision: 0,
+            source: params.source, tabID: "t", text: "",
+            truncated: false, workspaceID: "w")
+    }
+
+    func promptAgent(_ params: AgentPromptParams) async throws -> Agent {
+        agentPromptParams.append(params)
+        let oneShotFailure = agentPromptFailures.isEmpty ? nil : agentPromptFailures.removeFirst()
+        let failure = agentPromptFailure
+        let gate = nextAgentPromptGate
+        nextAgentPromptGate = nil
+        await gate?.waitUntilOpen()
+        if let oneShotFailure { throw oneShotFailure }
+        if let failure { throw failure }
+        return Agent(.fixture(paneID: params.target, status: .working))
+    }
+
+    func sendAgentKeys(_: AgentSendKeysParams) async throws {}
+
+    func startAgent(_ request: AgentLaunchRequest) async throws -> Agent {
+        agentStarts.append(request)
+        if let startFailure { throw startFailure }
+        if let startedAgent { return Agent(startedAgent) }
+        // Synthesize a freshly-Working agent so the caller and the follow-up
+        // snapshot see the same pane the real server would report.
+        return Agent(
+            .fixture(
+                paneID: "\(request.workspaceID ?? "w1"):pnew", status: .working,
+                workspaceID: request.workspaceID ?? "w1", kind: request.kind,
+                title: request.name))
+    }
+
+    func startAgentInNewWorktree(
+        _ request: AgentLaunchRequest, worktree: WorktreeSpec
+    ) async throws -> Agent {
+        worktreeStarts.append((request, worktree))
+        if let startFailure { throw startFailure }
+        if let startedAgent { return Agent(startedAgent) }
+        // The real server answers with an agent in the *new* worktree
+        // workspace, not the source one.
+        return Agent(
+            .fixture(
+                paneID: "wt1:pnew", status: .working, workspaceID: "wt1",
+                kind: request.kind, title: request.name))
+    }
+
+    func startAgentInNewWorkspace(
+        _ request: AgentLaunchRequest, workspace: NewWorkspaceSpec
+    ) async throws -> Agent {
+        workspaceStarts.append((request, workspace))
+        if let startFailure { throw startFailure }
+        if let startedAgent { return Agent(startedAgent) }
+        return Agent(
+            .fixture(
+                paneID: "nw1:pnew", status: .working, workspaceID: "nw1",
+                kind: request.kind, title: request.name))
+    }
+
+    func closePane(_ params: PaneTarget) async throws {
+        if let closeFailure { throw closeFailure }
+        closedPanes.append(params)
+    }
+
+    func closeTab(_ params: TabTarget) async throws {
+        if let closeFailure { throw closeFailure }
+        closedTabs.append(params)
+    }
+
+    func listWorktrees(forWorkspaceID workspaceID: String) async throws -> WorktreeListResponse {
+        listedWorktreeWorkspaceIDs.append(workspaceID)
+        if let worktreeListFailure { throw worktreeListFailure }
+        guard let worktreeListResponse else {
+            throw TransportError.channelFailed(detail: "no worktree list scripted")
+        }
+        return worktreeListResponse
+    }
+
+    func removeWorktree(
+        _ request: WorktreeRemovalRequest,
+        authorize: @escaping @Sendable (WorktreeRemovalRequest) async throws -> Void,
+        onDispatched: @escaping @Sendable (WorktreeRemovalRequest) async -> Void
+    ) async throws -> WorktreeRemovedResponse {
+        let gate = nextWorktreeAuthorizationGate
+        nextWorktreeAuthorizationGate = nil
+        await gate?.waitUntilOpen()
+        try await authorize(request)
+        removedWorktreeRequests.append(request)
+        await onDispatched(request)
+        if let worktreeRemoveFailure { throw worktreeRemoveFailure }
+        return WorktreeRemovedResponse(
+            forced: false,
+            path: worktreeRemoveResponsePath ?? request.identity.checkoutPath,
+            workspaceID: request.identity.workspaceID)
+    }
+
+    func focusAgent(_ target: AgentTarget) async throws {
+        agentFocuses.append(target)
+        if let focusFailure { throw focusFailure }
+    }
+
+    func renameAgent(_ params: AgentRenameParams) async throws {
+        if let renameFailure { throw renameFailure }
+        agentRenames.append(params)
+    }
+
+    func renameWorkspace(_ params: WorkspaceRenameParams) async throws {
+        if let renameFailure { throw renameFailure }
+        workspaceRenames.append(params)
+    }
+
+    func createShellTerminal(
+        _ request: ShellTerminalCreationRequest
+    ) async throws -> ShellTerminalIdentity {
+        shellTerminalCreations.append(request)
+        let gate = nextShellTerminalCreationGate
+        nextShellTerminalCreationGate = nil
+        await gate?.waitUntilOpen()
+        if let shellTerminalCreationFailure { throw shellTerminalCreationFailure }
+        return shellTerminalIdentity
+    }
+
+    func subscribeToEvents(_ subscriptions: [EventSubscription]) async throws -> HerdrEventStream {
+        guard liveStreamID == nil else {
+            throw TransportError.eventsChannelAlreadyOpen
+        }
+        capturedSubscriptions.append(subscriptions)
+        let gate = nextSubscriptionGate
+        nextSubscriptionGate = nil
+        await gate?.waitUntilOpen()
+        if let missing = subscriptions.firstMissingPane(in: missingPaneIDs) {
+            throw HerdrAPIError(code: "pane_not_found", message: "pane \(missing) not found")
+        }
+        nextStreamID += 1
+        let streamID = nextStreamID
+        let (events, continuation) = AsyncThrowingStream<HerdrEvent, any Error>.makeStream()
+        liveStreamID = streamID
+        eventContinuation = continuation
+        for observer in subscriptionObservers.values { observer.yield(subscriptions) }
+        return HerdrEventStream(events: events) {
+            await self.endStream(id: streamID)
+        }
+    }
+
+    func attachTerminal(_ request: TerminalAttachRequest) async throws -> TerminalAttachSession {
+        guard liveAttachID == nil else {
+            throw TransportError.terminalChannelAlreadyOpen
+        }
+        attachRequests.append(request)
+        let gate = nextAttachGate
+        nextAttachGate = nil
+        await gate?.waitUntilOpen()
+        nextAttachID += 1
+        let attachID = nextAttachID
+        let (output, outputContinuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let input = TerminalAttachInputQueue()
+        let endGate = nextAttachEndGate
+        nextAttachEndGate = nil
+        let sessionGate = nextAttachSessionGate
+        nextAttachSessionGate = nil
+        liveAttachID = attachID
+        attachContinuation = outputContinuation
+        attachInputTask = Task {
+            while let item = await input.next() {
+                self.recordAttachInput(item)
+            }
+        }
+        await sessionGate?.waitUntilOpen()
+        return TerminalAttachSession(output: { output }, input: input) {
+            await endGate?.waitUntilOpen()
+            await self.endAttach(id: attachID)
+        }
+    }
+
+    func stageImage(
+        _ image: PreparedImage,
+        progress: @escaping @Sendable (AttachmentStageProgress) async -> Void
+    ) async throws -> StagedImage {
+        stageRequests.append(image)
+        await progress(
+            AttachmentStageProgress(transferredBytes: 0, totalBytes: image.byteCount))
+        let gate = stageGate
+        stageGate = nil
+        await gate?.waitUntilOpen()
+        try Task.checkCancellation()
+        await progress(
+            AttachmentStageProgress(
+                transferredBytes: image.byteCount,
+                totalBytes: image.byteCount))
+        guard !stageOutcomes.isEmpty else {
+            throw AttachmentStagingError.transferFailed
+        }
+        return try stageOutcomes.removeFirst().get()
+    }
+
+    func stageFile(
+        _ file: PreparedFile,
+        progress: @escaping @Sendable (AttachmentStageProgress) async -> Void
+    ) async throws -> StagedFile {
+        fileStageRequests.append(file)
+        await progress(
+            AttachmentStageProgress(transferredBytes: 0, totalBytes: file.byteCount))
+        let gate = fileStageGate
+        fileStageGate = nil
+        await gate?.waitUntilOpen()
+        try Task.checkCancellation()
+        await progress(
+            AttachmentStageProgress(
+                transferredBytes: file.byteCount,
+                totalBytes: file.byteCount))
+        guard !fileStageOutcomes.isEmpty else {
+            throw AttachmentStagingError.transferFailed
+        }
+        return try fileStageOutcomes.removeFirst().get()
+    }
+
+    func readNotificationRegistration() async throws -> Data? {
+        notificationRegistrationReads += 1
+        if let failure = notificationRegistrationReadFailure { throw failure }
+        return notificationRegistration
+    }
+
+    func replaceNotificationRegistration(_ contents: Data) async throws {
+        if let gate = notificationRegistrationWriteGate {
+            notificationRegistrationWriteIsBlocked = true
+            await gate.enterAndHold()
+            notificationRegistrationWriteIsBlocked = false
+        }
+        try Task.checkCancellation()
+        if let failure = notificationRegistrationWriteFailure,
+            !notificationRegistrationWriteFailsAfterLanding
+        {
+            throw failure
+        }
+        notificationRegistration = contents
+        replacedNotificationRegistrations.append(contents)
+        if let failure = notificationRegistrationWriteFailure { throw failure }
+    }
+
+    func readNotificationConfig() async throws -> Data? {
+        notificationConfigReads += 1
+        if let failure = notificationRegistrationReadFailure { throw failure }
+        return notificationConfig
+    }
+
+    func replaceNotificationConfig(_ contents: Data) async throws {
+        if let failure = notificationRegistrationWriteFailure { throw failure }
+        notificationConfig = contents
+        replacedNotificationConfigs.append(contents)
+    }
+
+    /// Queues the outcomes of the next untracked-directory listings, in order.
+    func scriptUntrackedDirectoryListings(
+        _ outcomes: [Result<UntrackedDirectoryListing, any Error>]
+    ) {
+        untrackedDirectoryOutcomes.append(contentsOf: outcomes)
+    }
+
+    /// Holds the next listing, after it is recorded, until `gate` opens.
+    func gateNextUntrackedDirectoryListing(using gate: ScriptedTransportCallGate) {
+        nextUntrackedDirectoryGate = gate
+    }
+
+    func listUntrackedDirectory(
+        _ request: UntrackedDirectoryRequest
+    ) async throws -> UntrackedDirectoryListing {
+        untrackedDirectoryRequests.append(request)
+        let outcome: Result<UntrackedDirectoryListing, any Error> =
+            untrackedDirectoryOutcomes.isEmpty
+            ? .failure(ChangesReadError.unavailable) : untrackedDirectoryOutcomes.removeFirst()
+        let gate = nextUntrackedDirectoryGate
+        nextUntrackedDirectoryGate = nil
+        if let gate { await gate.waitUntilOpen() }
+        return try outcome.get()
+    }
+
+    /// Queues the outcomes of the next Changes reads, in order.
+    func scriptChangesReads(_ outcomes: [Result<CheckoutChangesRead, any Error>]) {
+        changesReadOutcomes.append(contentsOf: outcomes)
+    }
+
+    /// Holds the next Changes read, after it is recorded, until `gate` opens.
+    func gateNextChangesRead(using gate: ScriptedTransportCallGate) {
+        nextChangesReadGate = gate
+    }
+
+    func readChanges(_ request: ChangesReadRequest) async throws -> CheckoutChangesRead {
+        changesReadRequests.append(request)
+        let outcome: Result<CheckoutChangesRead, any Error> =
+            changesReadOutcomes.isEmpty
+            ? .failure(ChangesReadError.unavailable) : changesReadOutcomes.removeFirst()
+        let gate = nextChangesReadGate
+        nextChangesReadGate = nil
+        if let gate { await gate.waitUntilOpen() }
+        return try outcome.get()
+    }
+
+    /// Queues the outcomes of the next file-patch reads, in order.
+    func scriptFilePatchReads(_ outcomes: [Result<FilePatch, any Error>]) {
+        filePatchReadOutcomes.append(contentsOf: outcomes)
+    }
+
+    /// Holds the next file-patch read until `gate` opens, even if cancelled.
+    func gateNextFilePatchRead(using gate: ScriptedTransportCallGate) {
+        nextFilePatchReadGate = gate
+    }
+
+    func readFilePatch(_ request: FilePatchRequest) async throws -> FilePatch {
+        filePatchRequests.append(request)
+        let outcome: Result<FilePatch, any Error> =
+            filePatchReadOutcomes.isEmpty
+            ? .failure(ChangesReadError.unavailable) : filePatchReadOutcomes.removeFirst()
+        let gate = nextFilePatchReadGate
+        nextFilePatchReadGate = nil
+        if let gate { await gate.waitUntilOpen() }
+        return try outcome.get()
+    }
+
+    func gateNextSidebarLayoutRead(_ gate: ScriptedTransportCallGate) {
+        nextSidebarLayoutGate = gate
+    }
+
+    func readSidebarLayout() async throws -> Data? {
+        sidebarLayoutReads += 1
+        let data = sidebarLayout
+        let failure = sidebarLayoutReadFailure
+        let gate = nextSidebarLayoutGate
+        nextSidebarLayoutGate = nil
+        if let gate { await gate.waitUntilOpen() }
+        if let failure { throw failure }
+        return data
+    }
+
+    var isConnected: Bool {
+        connectionAlive && !isClosed
+    }
+
+    /// Scripts the connection's liveness independently of the events stream,
+    /// so a test can hold the session's silent transport-replacement path
+    /// open (a degraded connection its events reader has not reported yet).
+    func setConnectionAlive(_ alive: Bool) {
+        connectionAlive = alive
+    }
+
+    func close() async throws {
+        let gate = closeGate
+        closeGate = nil
+        await gate?.waitUntilOpen()
+        isClosed = true
+        eventContinuation?.finish()
+        eventContinuation = nil
+        liveStreamID = nil
+        attachContinuation?.finish()
+        attachContinuation = nil
+        liveAttachID = nil
+    }
+
+    /// Explicit `end()` on the stream: finishes it gracefully, exactly like
+    /// the real channel closed by its consumer.
+    private func endStream(id: UInt64) {
+        guard liveStreamID == id else { return }
+        eventContinuation?.finish()
+        eventContinuation = nil
+        liveStreamID = nil
+    }
+
+    private func recordAttachInput(_ input: TerminalAttachInput) {
+        attachInputs.append(input)
+    }
+
+    /// Explicit `end()` on the session: finishes it gracefully, exactly like
+    /// the real channel closed by its consumer. Drains the input recording
+    /// first — `end()` finishes the input queue before calling this — so
+    /// tests can assert on `attachInputs` without polling.
+    private func endAttach(id: UInt64) async {
+        await attachInputTask?.value
+        attachInputTask = nil
+        guard liveAttachID == id else { return }
+        attachContinuation?.finish()
+        attachContinuation = nil
+        liveAttachID = nil
+    }
+}
+
+private extension Sequence<EventSubscription> {
+    /// The first pane-scoped entry naming a pane in `missing`, if any.
+    func firstMissingPane(in missing: Set<String>) -> String? {
+        for subscription in self {
+            guard case .pane(_, let paneID) = subscription, missing.contains(paneID) else {
+                continue
+            }
+            return paneID
+        }
+        return nil
+    }
+}
+
+/// Hands scripted transports to an `EventsSession`'s `connect` closure in
+/// order, one per dial, and counts the dials. The last entry repeats if the
+/// session reconnects more often than the test scripted.
+actor SequencedTransportConnector {
+    private let transports: [ScriptedTransport]
+    private(set) var connectCount = 0
+
+    init(_ transports: [ScriptedTransport]) {
+        precondition(!transports.isEmpty)
+        self.transports = transports
+    }
+
+    func connect() async throws -> any Transport {
+        let transport = transports[min(connectCount, transports.count - 1)]
+        connectCount += 1
+        return transport
+    }
+}
+
+/// A one-shot test gate that exposes when a scripted transport call has
+/// captured its response, then holds that response until the test releases it.
+actor ScriptedTransportCallGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private var entryWaiters: [
+        (count: Int, continuation: CheckedContinuation<Void, Never>)
+    ] = []
+    private(set) var entryCount = 0
+
+    func waitUntilOpen() async {
+        entryCount += 1
+        let reached = entryWaiters.filter { entryCount >= $0.count }
+        entryWaiters.removeAll { entryCount >= $0.count }
+        for waiter in reached {
+            waiter.continuation.resume()
+        }
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func waitForEntry(count: Int = 1) async {
+        guard entryCount < count else { return }
+        await withCheckedContinuation { continuation in
+            entryWaiters.append((count, continuation))
+        }
+    }
+
+    func open() {
+        isOpen = true
+        let resuming = waiters
+        waiters.removeAll()
+        for waiter in resuming { waiter.resume() }
+    }
+}
+
+// MARK: Fixtures
+
+extension SessionSnapshot {
+    static func fixture(
+        agents: [AgentInfo] = [], workspaces: [WorkspaceInfo] = [], protocolVersion: Int = 17
+    ) -> SessionSnapshot {
+        SessionSnapshot(
+            agents: agents, layouts: [], panes: [], protocolVersion: protocolVersion, tabs: [],
+            version: "0.7.5-fake", workspaces: workspaces)
+    }
+}
+
+extension AgentInfo {
+    static func fixture(
+        paneID: String,
+        status: AgentStatus = .idle,
+        workspaceID: String = "w1",
+        kind: String = "claude",
+        title: String = "Task",
+        revision: Int = 1,
+        name: String? = nil
+    ) -> AgentInfo {
+        AgentInfo(
+            agentStatus: status, focused: false, paneID: paneID, revision: revision,
+            tabID: "\(workspaceID):t1", terminalID: "term_\(paneID)",
+            workspaceID: workspaceID, agent: kind, cwd: "/work/\(workspaceID)",
+            name: name, terminalTitleStripped: title)
+    }
+}
+
+extension WorkspaceInfo {
+    static func fixture(
+        workspaceID: String,
+        label: String,
+        repoName: String? = nil,
+        checkoutPath: String? = nil,
+        isLinkedWorktree: Bool = false
+    ) -> WorkspaceInfo {
+        WorkspaceInfo(
+            activeTabID: "\(workspaceID):t1", agentStatus: .unknown, focused: false,
+            label: label, number: 1, paneCount: 1, tabCount: 1, workspaceID: workspaceID,
+            worktree: repoName.map { name in
+                WorkspaceWorktreeInfo(
+                    checkoutPath: checkoutPath ?? "/work/\(name)",
+                    isLinkedWorktree: isLinkedWorktree,
+                    repoKey: "/work/\(name)/.git", repoName: name, repoRoot: "/work/\(name)")
+            })
+    }
+}
+
+extension HerdrEvent {
+    /// A `pane.agent_status_changed` event line as the live wire delivers it.
+    static func agentStatusChanged(paneID: String, status: AgentStatus) -> HerdrEvent {
+        HerdrEvent(
+            kind: PaneEventKind.agentStatusChanged.kind,
+            data: .object([
+                "pane_id": .string(paneID),
+                "agent_status": .string(status.rawValue),
+                "state_labels": .object([:]),
+            ]))
+    }
+}

@@ -1,0 +1,370 @@
+import SwiftUI
+
+/// The new-agent sheet (#12, User Story 8): pick a Host and a launch target
+/// (an existing Workspace or a new one at a remote directory), type an
+/// installed Agent and its native arguments, and dispatch it through the
+/// Transport launch flow. On success the sheet dismisses and hands the
+/// started Agent's identity to `onStarted`; the owner opens it, so a fresh
+/// launch lands in its terminal instead of back on the list.
+struct StartAgentView: View {
+    @State private var store: StartAgentStore
+    @State private var directoryBrowser: RemoteDirectoryBrowser?
+    private let onStarted: (ConsoleAgent.ID) -> Void
+    private let console: ConsoleStore
+    @Environment(\.dismiss) private var dismiss
+
+    init(
+        hosts: [Host], console: ConsoleStore,
+        origin: StartAgentStore.LaunchOrigin? = nil,
+        onStarted: @escaping (ConsoleAgent.ID) -> Void
+    ) {
+        self.onStarted = onStarted
+        self.console = console
+        _store = State(
+            initialValue: StartAgentStore(
+                hosts: hosts,
+                workspaces: { console.workspaces(for: $0) },
+                existingAgentNames: { hostID in
+                    Set(
+                        console.agents
+                            .filter { $0.hostID == hostID }
+                            .compactMap { $0.agent.name })
+                },
+                discoverAgentKinds: { try await console.availableAgentKinds(on: $0) },
+                remoteHome: { try await console.remoteHomeDirectory(on: $0) },
+                start: { params, destination, hostID in
+                    switch destination {
+                    case .existingWorkspace:
+                        try await console.startAgent(params, on: hostID)
+                    case .newWorktree(let worktree):
+                        try await console.startAgentInNewWorktree(
+                            params, worktree: worktree, on: hostID)
+                    case .newWorkspace(let workspace):
+                        try await console.startAgentInNewWorkspace(
+                            params, workspace: workspace, on: hostID)
+                    }
+                },
+                awaitAgentVisible: { await console.waitForAgent($0) },
+                origin: origin))
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                if let origin = store.origin {
+                    Section {
+                        Text(origin.cwd)
+                            .font(.callout.monospaced())
+                            .lineLimit(2)
+                            .truncationMode(.middle)
+                    } header: {
+                        Text("Directory")
+                    } footer: {
+                        Text("The Agent starts in a new tab here, next to the one you opened this from.")
+                    }
+                } else {
+                    Section("Host") {
+                        Picker("Host", selection: $store.selectedHostID) {
+                            if store.selectedHostID == nil {
+                                Text("Select a Host").tag(Host.ID?.none)
+                            }
+                            ForEach(store.hosts) { @Sendable host in
+                                Text(host.displayName).tag(Host.ID?.some(host.id))
+                            }
+                        }
+                    }
+
+                    Section {
+                        StartWorkspacePicker(
+                            workspaces: store.workspaces,
+                            selectedWorkspaceID: store.launchTarget == .existingWorkspace
+                                ? store.selectedWorkspaceID : nil,
+                            newDirectory: store.newWorkspaceDirectory.isEmpty
+                                ? nil : store.newWorkspaceDirectory,
+                            isNewWorkspaceSelected: store.launchTarget == .newWorkspace,
+                            canBrowse: store.selectedHostID != nil,
+                            onSelect: store.selectExistingWorkspace,
+                            onSelectNewWorkspace: store.selectNewWorkspace,
+                            onNewWorkspace: openDirectoryBrowser)
+                        if store.launchTarget == .newWorkspace {
+                            TextField(
+                                "Workspace name (optional)",
+                                text: $store.newWorkspaceLabel)
+                                .autocorrectionDisabled()
+                            if store.newWorkspaceDirectory.isEmpty {
+                                Label(
+                                    "Directory: the Host's home directory",
+                                    systemImage: "house")
+                                    .font(.callout)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                Label(store.newWorkspaceDirectory, systemImage: "folder")
+                                    .font(.callout.monospaced())
+                                    .lineLimit(2)
+                                    .truncationMode(.middle)
+                            }
+                            Button("Browse Directory…", systemImage: "folder.badge.plus") {
+                                openDirectoryBrowser()
+                            }
+                        }
+                    } header: {
+                        Text("Workspace")
+                    } footer: {
+                        if store.launchTarget == .newWorkspace {
+                            Text(
+                                "Creates a fresh Workspace on the Host. An empty name uses the directory's name."
+                            )
+                        }
+                    }
+                }
+
+                if store.offersWorktree {
+                    Section {
+                        Toggle("Start in a new worktree", isOn: $store.startsInNewWorktree)
+                            .disabled(store.selectedWorkspaceID == nil)
+                        if store.startsInNewWorktree {
+                            TextField("Branch (optional)", text: $store.worktreeBranch)
+                                .font(.callout.monospaced())
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                            TextField("Base (optional)", text: $store.worktreeBase)
+                                .font(.callout.monospaced())
+                                .autocorrectionDisabled()
+                                .textInputAutocapitalization(.never)
+                        }
+                    } header: {
+                        Text("Worktree")
+                    } footer: {
+                        if let message = store.worktreeBranchErrorMessage {
+                            Text(message)
+                                .foregroundStyle(.red)
+                        } else if store.startsInNewWorktree {
+                            Text(
+                                "A fresh checkout of the workspace's repository. Empty fields use a generated worktree/ branch off HEAD."
+                            )
+                        } else {
+                            Text(
+                                "Run the agent in a clean checkout instead of the workspace itself."
+                            )
+                        }
+                    }
+                }
+
+                Section {
+                    switch store.agentDiscoveryState {
+                    case .idle:
+                        Text("Select a Host to detect installed Agents.")
+                            .foregroundStyle(.secondary)
+                    case .loading:
+                        HStack {
+                            ProgressView()
+                            Text("Detecting installed Agents…")
+                        }
+                    case .loaded where store.availableAgentKinds.isEmpty:
+                        ContentUnavailableView(
+                            "No Agents Found",
+                            systemImage: "magnifyingglass",
+                            description: Text(
+                                "Install a supported Agent CLI on this Host, then try again."))
+                        Button("Detect Again", systemImage: "arrow.clockwise") {
+                            Task { await store.discoverAgents() }
+                        }
+                    case .loaded:
+                        Picker("Agent", selection: $store.selectedAgentKind) {
+                            ForEach(store.availableAgentKinds) { @Sendable kind in
+                                Text("\(kind.displayName) (\(kind.executable))")
+                                    .tag(SupportedAgentKind?.some(kind))
+                            }
+                        }
+                        Button("Detect Again", systemImage: "arrow.clockwise") {
+                            Task { await store.discoverAgents() }
+                        }
+                    case .failed(let message):
+                        Label(message, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                        Button("Retry", systemImage: "arrow.clockwise") {
+                            Task { await store.discoverAgents() }
+                        }
+                    }
+                } header: {
+                    Text("Agent")
+                } footer: {
+                    Text("Agents installed and launchable from this Host's PATH.")
+                }
+
+                Section {
+                    TextField("Agent name (optional)", text: $store.name)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                } header: {
+                    Text("Agent Name")
+                } footer: {
+                    if let message = store.nameErrorMessage {
+                        Text(message)
+                            .foregroundStyle(.red)
+                    } else if let defaultName = store.defaultAgentName {
+                        Text("Empty names the agent \(Text(defaultName).monospaced()).")
+                    } else {
+                        Text("Empty names the agent after its kind.")
+                    }
+                }
+
+                Section {
+                    TextField("Tab name (optional)", text: $store.tabLabel)
+                        .autocorrectionDisabled()
+                } header: {
+                    Text("Tab Name")
+                } footer: {
+                    Text("Empty labels the tab with the agent's name.")
+                }
+
+                Section {
+                    AgentArgumentsField(
+                        text: $store.arguments,
+                        placeholder: "Arguments (optional)")
+                } header: {
+                    Text("Arguments")
+                } footer: {
+                    if let message = store.argumentErrorMessage {
+                        Text(message)
+                            .foregroundStyle(.red)
+                    } else {
+                        Text(
+                            "Quotes and backslash escapes are supported.\ne.g. \(Text(#"--model "gpt 5" --continue"#).monospaced())"
+                        )
+                    }
+                }
+
+                if case .failed(let message) = store.state {
+                    Section {
+                        Label(message, systemImage: "exclamationmark.triangle")
+                            .foregroundStyle(.red)
+                    }
+                }
+            }
+            // The last footer ends clear of the sheet's rounded corners
+            // when the form fits it.
+            .contentMargins(.bottom, 20, for: .scrollContent)
+            // The form grows as a Host adds its Agent and argument rows; a
+            // fixed form cut them off under a scroll.
+            .consoleSheetPage()
+            .navigationTitle("New Agent")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                        .disabled(!store.canDismiss)
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    if store.state == .starting {
+                        ProgressView()
+                    } else {
+                        Button("Start") {
+                            Task { await store.submit() }
+                        }
+                        .disabled(!store.canSubmit)
+                    }
+                }
+            }
+            .onChange(of: store.state) {
+                if case .started(let id) = store.state {
+                    dismiss()
+                    onStarted(id)
+                }
+            }
+            .task(id: store.selectedHostID) {
+                await store.discoverAgents()
+            }
+            // The presented item also supplies the content, so the first
+            // presentation cannot capture an empty browser from an older view.
+            .sheet(item: $directoryBrowser) { browser in
+                RemoteDirectoryBrowserView(browser: browser) { path in
+                    store.applyBrowsedDirectory(path)
+                    directoryBrowser = nil
+                }
+            }
+            .interactiveDismissDisabled(!store.canDismiss)
+        }
+    }
+
+    private func openDirectoryBrowser() {
+        guard let hostID = store.selectedHostID else { return }
+        directoryBrowser = RemoteDirectoryBrowser(
+            resolveHome: { try await console.remoteHomeDirectory(on: hostID) },
+            list: { try await console.listRemoteDirectories(at: $0, on: hostID) })
+    }
+}
+
+/// Keeps the latest browsed directory as the final menu option, even when an
+/// existing Workspace is selected. Browsing only updates the launch draft.
+struct StartWorkspacePicker: View {
+    private enum Selection: Hashable {
+        case existing(String)
+        case newWorkspace
+        /// New Workspace: opens the directory browser, never selected.
+        case browse
+    }
+
+    let workspaces: [ConsoleWorkspace]
+    let selectedWorkspaceID: String?
+    let newDirectory: String?
+    let isNewWorkspaceSelected: Bool
+    let canBrowse: Bool
+    let onSelect: (String) -> Void
+    let onSelectNewWorkspace: () -> Void
+    let onNewWorkspace: () -> Void
+
+    private var directoryName: String {
+        newDirectory.map { RemoteHostPath.lastComponent(of: $0) } ?? "/"
+    }
+
+    private var selection: Binding<Selection?> {
+        Binding(
+            get: {
+                isNewWorkspaceSelected ? .newWorkspace : selectedWorkspaceID.map(Selection.existing)
+            },
+            set: { value in
+                switch value {
+                case .existing(let id): onSelect(id)
+                case .newWorkspace: onSelectNewWorkspace()
+                case .browse: onNewWorkspace()
+                case nil: break
+                }
+            })
+    }
+
+    /// A menu picker, as the Host row above it is: the whole row opens it,
+    /// from the value at its trailing edge. New Workspace is its last
+    /// option, which browses instead of becoming the selection. It must be
+    /// the row itself: wrapped, the form draws it as a bare button.
+    var body: some View {
+        Picker(selection: selection) {
+            if selectedWorkspaceID == nil && !isNewWorkspaceSelected {
+                Text("None reported").tag(Selection?.none)
+            }
+            ForEach(workspaces) { @Sendable workspace in
+                Text(workspace.label).tag(Selection?.some(.existing(workspace.id)))
+            }
+            if newDirectory != nil {
+                Text(directoryName).tag(Selection?.some(.newWorkspace))
+            } else if isNewWorkspaceSelected {
+                Text("Home").tag(Selection?.some(.newWorkspace))
+            }
+            Divider()
+            Label("New Workspace", systemImage: "folder.badge.plus")
+                .tag(Selection?.some(.browse))
+                .accessibilityIdentifier("new-workspace")
+        } label: {
+            Text("Workspace")
+            // The browsed directory in full, under the row's title.
+            if isNewWorkspaceSelected, let newDirectory {
+                Text(newDirectory)
+            }
+        }
+        // The form's own picker style, not `.menu`, which draws a bare
+        // accent-colored value that only it opens.
+        .menuOrder(.fixed)
+        .disabled(!canBrowse)
+        .accessibilityIdentifier("start-workspace-picker")
+    }
+}

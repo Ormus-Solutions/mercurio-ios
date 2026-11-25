@@ -1,0 +1,12 @@
+Mercurio for iOS
+Copyright 2026 Ormus Solutions
+
+This program is a modification of Heeler.
+Heeler is copyright its authors and is licensed under the Apache License,
+Version 2.0. The license is in the LICENSE file. Mercurio's changes are
+licensed under the same terms.
+
+Upstream module names, the Heeler herdr plugin, and the third-party notices
+under Sources/Heeler/Resources/Notices stay in place so this fork can merge
+later Heeler releases. This distribution is not endorsed by the Heeler
+maintainers.

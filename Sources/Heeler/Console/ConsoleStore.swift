@@ -1,0 +1,1387 @@
+import Foundation
+import HeelerSSH
+import Observation
+
+/// The Console aggregate: reconciles the Host catalog and publishes one
+/// Agent list with independent Pin and per-Host sidebar ordering. Each HostConsoleProjection
+/// owns its own convergence, retry, snippets and Host-scoped RPC behavior.
+@MainActor
+@Observable
+final class ConsoleStore {
+    struct AgentStatusUpdate: Sendable, Equatable {
+        let status: AgentStatus?
+        let liveUpdatesAvailable: Bool
+        /// The Host connection the status came over; a new one may follow
+        /// turns that ran while no connection could see them.
+        var connectionGeneration: UInt64? = nil
+    }
+
+    private(set) var agents: [ConsoleAgent] = []
+    private(set) var terminals: [ConsoleTerminal] = []
+    private(set) var hostStatuses: [Host.ID: EventsSessionStatus] = [:]
+    private(set) var hostStandingFailures: [Host.ID: TransportError] = [:]
+    private(set) var hostLatencies: [Host.ID: Duration] = [:]
+    /// The route each connected Host's current connection reached.
+    private(set) var hostRouteIDs: [Host.ID: HostRoute.ID] = [:]
+    private(set) var hostSyncErrors: [Host.ID: String] = [:]
+    private(set) var hostConnectionGenerations: [Host.ID: UInt64] = [:]
+    /// Hosts whose current connection has not produced its first snapshot.
+    /// Their empty Agent projection is loading state, not proof that a pane
+    /// disappeared.
+    private(set) var hostsAwaitingSnapshot: Set<Host.ID> = []
+    /// Latest snapshot workspaces by Host. This is observable state rather
+    /// than a projection lookup so an open New Agent picker refreshes when a
+    /// snapshot arrives or a workspace membership event resyncs the Host.
+    private(set) var workspacesByHost: [Host.ID: [ConsoleWorkspace]] = [:]
+    /// Successful or snapshot-reconciled removals keyed by the exact Agents
+    /// that belonged to the validated worktree. This survives their rows
+    /// disappearing so Agent detail can show a stable result.
+    private(set) var removedWorktreesByAgent: [
+        ConsoleAgent.ID: WorktreeRemovalReceipt
+    ] = [:]
+    /// Each Host's platform as its connection reported it; Chat offers
+    /// itself only on a Host known to be POSIX. Kept across reconnects of
+    /// one catalog entry, so a reconnect does not take an open Chat away,
+    /// and asked again on each new connection.
+    private(set) var hostPlatforms: [Host.ID: HostPlatform] = [:]
+    /// The connection each Host's platform was last asked on.
+    @ObservationIgnored private var hostPlatformGenerations: [Host.ID: UInt64] = [:]
+
+    @ObservationIgnored private var projections: [
+        Host.ID: HostConsoleProjection
+    ] = [:]
+    /// Skills probed per Host connection: keyed on the connection generation
+    /// so a reconnect naturally invalidates, and evicted per Host on insert
+    /// so stale generations cannot accumulate.
+    @ObservationIgnored private var skillsCache: [SkillsCacheKey: [AgentSkill]] = [:]
+    /// Status events already converge through each Host's one pane-scoped
+    /// subscription. Composers consume this fan-out instead of opening a
+    /// second events channel that could outlive the connection snapshot.
+    @ObservationIgnored private var agentStatusObservers: [
+        ConsoleAgent.ID: [UUID: AsyncStream<AgentStatusUpdate>.Continuation]
+    ] = [:]
+    @ObservationIgnored private var gitExecGates: [Host.ID: GitExecGate] = [:]
+    /// The Agents list's Changes totals, one store per Agent, shared by
+    /// every window's rows and by nothing else.
+    @ObservationIgnored private(set) lazy var rowChanges = AgentRowChanges { [unowned self] agent in
+        makeChangesStore(
+            agentID: agent.id, hostID: agent.hostID, openingDirectory: agent.directory)
+    }
+    /// Composer ownership sits above the detail branch so a transient
+    /// missing-Agent placeholder during reconnect cannot destroy a draft, and
+    /// no view's lifetime decides an upload's.
+    @ObservationIgnored private var composerSessions: [
+        ConsoleAgent.ID: AgentComposerSession
+    ] = [:]
+    /// The shell tab this app created per Workspace, so Open Terminal
+    /// reattaches to it instead of accumulating a new tab per visit.
+    /// In-memory on purpose: tabs die with the herdr server, and reuse
+    /// verifies liveness before attaching, so persistence would only add
+    /// stale state. Deliberately kept across reconnects — tabs survive them.
+    @ObservationIgnored private var shellTerminals: [
+        ShellTerminalKey: ShellTerminalIdentity
+    ] = [:]
+
+    private struct ShellTerminalKey: Hashable {
+        let hostID: Host.ID
+        let workspaceID: String
+    }
+    @ObservationIgnored private let makeSession:
+        @Sendable (Host, [EventSubscription]) -> EventsSession
+    @ObservationIgnored private let snapshotRetryDelay: Duration
+    @ObservationIgnored private let chatPrefetchRetryDelay: Duration
+    @ObservationIgnored private var isActive = false
+    /// The most recently enqueued lifecycle transition. Suspend and resume
+    /// are each several awaits long, so without a chain a resume racing a
+    /// suspend can finish first and leave every Host suspended with nothing
+    /// left to re-activate it.
+    @ObservationIgnored private var lifecycleTask: Task<Void, Never>?
+    /// Shared with the Console list: a pin toggle must re-sort `agents` in
+    /// the same turn, so the store lives here rather than only on the view.
+    let pins: PinnedAgentsStore
+    let rowLayouts: AgentRowLayoutStore
+    let sidebarSnapshots = HerdrSidebarSnapshotStore()
+    let pluginStatuses = HeelerPluginStatusStore()
+    let terminalConnections: TerminalConnectionPool
+    let agentTerminals: AgentTerminalCache
+    /// Chat's saved conversations. Volatile unless the app passes the file
+    /// cache: demo mode and tests build Console stores in the app's own
+    /// container, and their `setHosts` would otherwise clear the real one.
+    @ObservationIgnored let chatCache: any ChatTranscriptCache
+    let cachedChats: ConsoleChatCache
+    @ObservationIgnored private var chatPrefetchTasks: [Host.ID: Task<Void, Never>] = [:]
+    @ObservationIgnored private var chatPrefetched: [ConsoleAgent.ID: String] = [:]
+    /// Prefetches that found no conversation yet, by the key they ran for.
+    @ObservationIgnored private var chatPrefetchRetries: [ConsoleAgent.ID: (key: String, count: Int)] = [:]
+    /// The connection whose saved Chat bindings were last re-proved, per Host.
+    @ObservationIgnored private var chatCacheValidatedGenerations: [Host.ID: UInt64] = [:]
+    @ObservationIgnored private var chatCacheRetention: Task<Void, Never>?
+    /// How Chat reads each program's transcripts; nil leaves the program
+    /// without Chat.
+    @ObservationIgnored private let chatAdapter: @Sendable (ChatProgram) -> ChatTranscriptAdapter?
+    /// One Chat per Agent whose detail has shown it, kept like the Composer
+    /// so leaving and returning keeps the conversation and its position.
+    @ObservationIgnored private var chatStores: [ConsoleAgent.ID: AgentChatStore] = [:]
+    @ObservationIgnored private var terminalSnapshotRevisions: [Host.ID: UInt64] = [:]
+    @ObservationIgnored private var terminalTransportGenerations: [Host.ID: UInt64] = [:]
+
+    init(
+        snapshotRetryDelay: Duration = .seconds(2),
+        chatPrefetchRetryDelay: Duration = .seconds(5),
+        pins: PinnedAgentsStore = PinnedAgentsStore(),
+        rowLayouts: AgentRowLayoutStore = AgentRowLayoutStore(),
+        chatCache: any ChatTranscriptCache = VolatileChatTranscriptCache(),
+        makeSession: @escaping @Sendable (Host, [EventSubscription]) -> EventsSession =
+            ConsoleStore.sshSessionFactory(),
+        chatAdapter: @escaping @Sendable (ChatProgram) -> ChatTranscriptAdapter? = {
+            ChatTranscriptAdapter.standard(for: $0)
+        }
+    ) {
+        self.chatCache = chatCache
+        cachedChats = ConsoleChatCache(cache: chatCache)
+        self.chatAdapter = chatAdapter
+        let terminalBudget = TerminalRetentionBudget()
+        terminalConnections = TerminalConnectionPool(budget: terminalBudget)
+        agentTerminals = AgentTerminalCache(budget: terminalBudget)
+        self.snapshotRetryDelay = snapshotRetryDelay
+        self.chatPrefetchRetryDelay = chatPrefetchRetryDelay
+        self.pins = pins
+        self.rowLayouts = rowLayouts
+        self.makeSession = makeSession
+    }
+
+    /// Pins or unpins the Agent and re-sorts the published list in the same
+    /// turn — a pin must not wait on a reconnect to move.
+    func togglePin(hostID: Host.ID, paneID: String) {
+        pins.togglePin(hostID: hostID, paneID: paneID)
+        rebuild()
+    }
+
+    /// Aligns Host projections with the catalog. Editing a Host replaces its
+    /// projection because its connection coordinates may have changed.
+    func setHosts(_ hosts: [Host]) {
+        let incoming = Dictionary(hosts.map { ($0.id, $0) }) { _, last in last }
+        cachedChats.setHosts(hosts)
+        for id in projections.keys where incoming[id] != projections[id]?.host {
+            chatPrefetchTasks[id]?.cancel()
+            chatPrefetchTasks[id] = nil
+            chatPrefetched = chatPrefetched.filter { $0.key.hostID != id }
+            chatPrefetchRetries = chatPrefetchRetries.filter { $0.key.hostID != id }
+            chatCacheValidatedGenerations[id] = nil
+        }
+        for (id, session) in composerSessions where incoming[id.hostID] == nil {
+            session.leaveStaging()
+            composerSessions[id] = nil
+        }
+        // A changed Host may name another herdr session, which keys Chat's
+        // cache: its Chats start over.
+        for (id, store) in chatStores where incoming[id.hostID] != projections[id.hostID]?.host {
+            store.end()
+            chatStores[id] = nil
+        }
+        // Also the launch-time sweep: a Host removed while the app was not
+        // running leaves a cache no one else would delete. Chained, so the
+        // cache ends on the latest catalog whatever order tasks start in.
+        let hostIDs = Set(incoming.keys)
+        chatCacheRetention = Task { [previous = chatCacheRetention, chatCache] in
+            await previous?.value
+            await chatCache.retainHosts(hostIDs)
+        }
+        for (id, projection) in projections where incoming[id] != projection.host {
+            sidebarSnapshots.invalidate(id)
+            pluginStatuses.invalidate(id)
+            terminalSnapshotRevisions[id] = nil
+            terminalTransportGenerations[id] = nil
+            hostPlatforms[id] = nil
+            hostPlatformGenerations[id] = nil
+            Task {
+                await terminalConnections.removeHost(id)
+                await agentTerminals.removeHost(id)
+            }
+            projection.end()
+            projections[id] = nil
+        }
+        for host in hosts where projections[host.id] == nil {
+            startProjection(for: host)
+        }
+        rebuild()
+    }
+
+    func resume() async {
+        await activate(revalidating: false)
+    }
+
+    /// Foreground activation: activates whatever is suspended, and re-proves
+    /// whatever is not. A session the app was still holding when it went away
+    /// comes back believing it is connected even when its link died in the
+    /// meantime, and `resume()` has nothing to re-activate on it — so without
+    /// the second half the Console shows a connection that is already gone
+    /// until the keepalive gets round to noticing, up to its interval plus a
+    /// request timeout later (#142). A Host already stopped on a
+    /// non-retryable failure is asked once more here too: `resume()` no-ops on
+    /// it as well, so on a return that no suspension preceded, nothing else
+    /// would ask it again (#147).
+    func reactivate() async {
+        await activate(revalidating: true)
+    }
+
+    private func activate(revalidating: Bool) async {
+        await enqueueLifecycleTransition { [self] in
+            isActive = true
+            for store in chatStores.values { store.resume() }
+            let projections = Array(self.projections.values)
+            for projection in projections {
+                await projection.resume()
+            }
+            guard revalidating else { return }
+            // Every Host, not only one the user has navigated to: recovery
+            // that depends on navigation just trades the Retry button for
+            // another hidden step, and the Console is a single list across
+            // all Hosts anyway, so it has no notion of one being on screen.
+            // The population this costs anything for is the Hosts currently
+            // *failed*, which is normally none (#147).
+            //
+            // All at once: re-proving is one bounded round trip per Host, but
+            // its only bound is the Transport's request timeout, and a Host
+            // frozen with the app is exactly the case that runs it out.
+            // Serially that is N timeouts holding the lifecycle chain, and
+            // behind that chain sits any suspend() the user triggers by
+            // leaving again — including the didFinishSuspending() that
+            // releases the background assertion.
+            await withTaskGroup(of: Void.self) { group in
+                for projection in projections {
+                    group.addTask { await projection.revalidate() }
+                }
+            }
+        }
+    }
+
+    func suspend() async {
+        await enqueueLifecycleTransition { [self] in
+            isActive = false
+            for store in chatStores.values { store.suspend() }
+            // Before the terminals go: an upload ends interrupted, with
+            // Retry, rather than cancelled by the teardown.
+            for session in composerSessions.values { session.didSuspend() }
+            await terminalConnections.suspend()
+            await agentTerminals.suspend()
+            sidebarSnapshots.invalidateAll()
+            rebuild()
+            for projection in projections.values {
+                await projection.suspend()
+            }
+        }
+    }
+
+    /// Chains `transition` behind the previously enqueued one and waits for
+    /// it. Enqueueing is synchronous on the main actor, so the chain order is
+    /// the call order.
+    private func enqueueLifecycleTransition(
+        _ transition: @escaping @MainActor () async -> Void
+    ) async {
+        let previous = lifecycleTask
+        let task = Task { @MainActor in
+            await previous?.value
+            await transition()
+        }
+        lifecycleTask = task
+        await task.value
+    }
+
+    func retryFailedHosts() async {
+        for projection in projections.values {
+            await projection.retry()
+        }
+    }
+
+    /// Restarts one Host without disturbing other Hosts that may be connected,
+    /// reconnecting, or waiting for their own repair.
+    func retryHost(_ id: Host.ID) async {
+        await projections[id]?.retry()
+    }
+
+    /// Stops one Host's connection attempt (or its reconnect backoff) at
+    /// once instead of waiting for it to time out; a connected Host is left
+    /// alone. The Host reads Paused until it is retried or the app returns
+    /// to the foreground.
+    func cancelHostConnection(_ id: Host.ID) async {
+        await projections[id]?.cancelConnecting()
+    }
+
+    /// The returned runner resolves the Host's live projection on every
+    /// call: editing a Host replaces its projection (and session), and a
+    /// runner captured by a long-lived Attach screen must follow it there
+    /// instead of staying bound to the ended session.
+    func terminalRunner(for hostID: Host.ID) -> TerminalSessionRunner {
+        { [weak self] request, handler in
+            guard let runner = await self?.liveTerminalRunner(for: hostID) else {
+                throw TransportError.sshUnreachable(
+                    detail: "The Host is not connected.")
+            }
+            try await runner(request, handler)
+        }
+    }
+
+    /// Late-bound for the same reason as `terminalRunner(for:)`: a retryable
+    /// upload taken before a Host edit must stage over the new session.
+    func imageStager(for hostID: Host.ID) -> ImageStager {
+        { [weak self] image, reporter in
+            guard let stager = await self?.liveImageStager(for: hostID) else {
+                throw TransportError.sshUnreachable(
+                    detail: "The Host is not connected.")
+            }
+            return try await stager(image, reporter)
+        }
+    }
+
+    func fileStager(for hostID: Host.ID) -> FileStager {
+        { [weak self] file, reporter in
+            guard let stager = await self?.liveFileStager(for: hostID) else {
+                throw TransportError.sshUnreachable(
+                    detail: "The Host is not connected.")
+            }
+            return try await stager(file, reporter)
+        }
+    }
+
+    private func liveTerminalRunner(for hostID: Host.ID) -> TerminalSessionRunner? {
+        projections[hostID]?.terminalRunner()
+    }
+
+    private func liveImageStager(for hostID: Host.ID) -> ImageStager? {
+        projections[hostID]?.imageStager()
+    }
+
+    /// Ranged Host-file reads for the terminal usage strip (#325). Late-bound
+    /// for the same reason as `imageStager(for:)`: the strip refreshes on a
+    /// timer, and a reconnect between two refreshes must not leave it reading
+    /// through the transport that was replaced.
+    func sessionFileReader(for hostID: Host.ID) -> SessionFileReader {
+        { [weak self] range in
+            guard let reader = await self?.liveSessionFileReader(for: hostID) else {
+                throw TransportError.sshUnreachable(
+                    detail: "The Host is not connected.")
+            }
+            return try await reader(range)
+        }
+    }
+
+    private func liveSessionFileReader(for hostID: Host.ID) -> SessionFileReader? {
+        projections[hostID]?.sessionFileReader()
+    }
+
+    /// Model window lookups for the terminal usage strip (#325), late-bound
+    /// like `sessionFileReader(for:)`.
+    func modelContextWindowResolver(for hostID: Host.ID) -> ModelContextWindowResolver {
+        { [weak self] selector in
+            guard let resolver = await self?.liveModelContextWindowResolver(for: hostID) else {
+                throw TransportError.sshUnreachable(
+                    detail: "The Host is not connected.")
+            }
+            return try await resolver(selector)
+        }
+    }
+
+    private func liveModelContextWindowResolver(
+        for hostID: Host.ID
+    ) -> ModelContextWindowResolver? {
+        projections[hostID]?.modelContextWindowResolver()
+    }
+
+    private func liveFileStager(for hostID: Host.ID) -> FileStager? {
+        projections[hostID]?.fileStager()
+    }
+
+    func workspaces(for hostID: Host.ID) -> [ConsoleWorkspace] {
+        workspacesByHost[hostID] ?? []
+    }
+
+    /// The projection behind every Host-scoped RPC; an unconnected Host
+    /// fails loudly instead of silently dropping the action.
+    private func projection(for hostID: Host.ID) throws -> HostConsoleProjection {
+        guard let projection = projections[hostID] else {
+            throw TransportError.sshUnreachable(
+                detail: "The Host is not connected.")
+        }
+        return projection
+    }
+
+    /// Learns the Host's platform on its current connection, at most once
+    /// per connection. A failure keeps the last answer and lets the next
+    /// call ask again.
+    func resolveHostPlatform(_ hostID: Host.ID) async {
+        guard let projection = projections[hostID] else { return }
+        let generation = projection.transportGeneration
+        guard hostPlatformGenerations[hostID] != generation else { return }
+        hostPlatformGenerations[hostID] = generation
+        let platform: HostPlatform
+        do {
+            platform = try await projection.session.withTransport { transport in
+                try await transport.hostPlatform()
+            }
+        } catch {
+            if projections[hostID] === projection, hostPlatformGenerations[hostID] == generation {
+                hostPlatformGenerations[hostID] = nil
+            }
+            return
+        }
+        guard projections[hostID] === projection else { return }
+        if hostPlatforms[hostID] != platform { hostPlatforms[hostID] = platform }
+        reconcileChatCache()
+    }
+
+    func availableAgentKinds(on hostID: Host.ID) async throws -> [SupportedAgentKind] {
+        try await projection(for: hostID).availableAgentKinds()
+    }
+    /// Resolves the Host's remote home directory for the New Workspace
+    /// directory browser (#280). Throws the error's own presentation,
+    /// including homeDirectoryUnresolvable when the probe fails.
+    func remoteHomeDirectory(on hostID: Host.ID) async throws -> String {
+        try await projection(for: hostID).session.withTransport { transport in
+            guard let ssh = transport as? HeelerSSHTransport else {
+                throw TransportError.sshUnreachable(
+                    detail: "This Host cannot list remote directories.")
+            }
+            return try await ssh.remoteHomeDirectory()
+        }
+    }
+
+    /// Lists one absolute remote path's subdirectories for the New Workspace
+    /// directory browser (#280).
+    func listRemoteDirectories(at path: String, on hostID: Host.ID) async throws -> RemoteDirectoryListing {
+        try await projection(for: hostID).session.withTransport { transport in
+            guard let ssh = transport as? HeelerSSHTransport else {
+                throw TransportError.sshUnreachable(
+                    detail: "This Host cannot list remote directories.")
+            }
+            return try await ssh.listDirectories(at: path)
+        }
+    }
+
+    /// Ports the computer is serving, plus local URLs in `recentOutput`.
+    /// A failure is a listing, not a throw: the preview screen shows it.
+    func devPreviewListing(on hostID: Host.ID, recentOutput: String) async -> DevPreview.Listing {
+        do {
+            return try await projection(for: hostID).session.withTransport { transport in
+                guard let ssh = transport as? HeelerSSHTransport else {
+                    throw TransportError.sshUnreachable(detail: "This Host has no SSH connection.")
+                }
+                let output = try await ssh.commandOutput(DevPreview.listenCommand)
+                return DevPreview.readListening(
+                    stdout: String(decoding: output.stdout, as: UTF8.self),
+                    stderr: String(decoding: output.stderr, as: UTF8.self),
+                    exitCode: Int(output.exitStatus),
+                    recentOutput: recentOutput)
+            }
+        } catch {
+            return .failed(DevPreview.message(for: error))
+        }
+    }
+
+    /// Listens on the phone and forwards each browser connection to `host:port`
+    /// on this computer. The forwarder owns those connections until `stop()`.
+    func startDevPreview(host: String, port: Int, on hostID: Host.ID) async throws -> DevPreviewForwarder {
+        let opener = DevPreviewTunnelOpener { [weak self] host, port in
+            guard let self else { throw CancellationError() }
+            return try await self.openPreviewTunnel(host: host, port: port, on: hostID)
+        }
+        return try DevPreviewForwarder.start(host: host, port: port, opener: opener)
+    }
+
+    private func openPreviewTunnel(
+        host: String, port: Int, on hostID: Host.ID
+    ) async throws -> SSHTCPTunnel {
+        try await projection(for: hostID).session.withTransport { transport in
+            guard let ssh = transport as? HeelerSSHTransport else {
+                throw TransportError.sshUnreachable(detail: "This Host has no SSH connection.")
+            }
+            return try await ssh.openPreviewTunnel(host: host, port: port)
+        }
+    }
+
+    private struct SkillsCacheKey: Hashable {
+        let hostID: Host.ID
+        let generation: UInt64
+        let kind: SupportedAgentKind
+        let projectRoot: String?
+    }
+
+    /// The Skills pane's data source: probes the Host over its live Console
+    /// connection, cached per (connection, kind, project root) until the
+    /// connection is replaced. `forceRefresh` is the pane's manual refresh.
+    func fetchSkills(
+        kind: SupportedAgentKind,
+        projectRoot: String?,
+        on hostID: Host.ID,
+        forceRefresh: Bool = false
+    ) async throws -> [AgentSkill] {
+        let generation = hostConnectionGenerations[hostID] ?? 0
+        let key = SkillsCacheKey(
+            hostID: hostID, generation: generation, kind: kind, projectRoot: projectRoot)
+        if !forceRefresh, let cached = skillsCache[key] {
+            return cached
+        }
+        let query = SkillListQuery(kind: kind, projectRoot: projectRoot)
+        let skills = try await projection(for: hostID).session.withTransport { transport in
+            try await transport.listSkills(query)
+        }
+        skillsCache = skillsCache.filter {
+            $0.key.hostID != hostID || $0.key.generation == generation
+        }
+        skillsCache[key] = skills
+        return skills
+    }
+
+    /// The skill content sheet's data source: reads one skill document over
+    /// the Host's live Console connection. Uncached — it is user-triggered,
+    /// one file at a time.
+    func readSkillFile(path: String, on hostID: Host.ID) async throws -> String {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.readSkillFile(atPath: path)
+        }
+    }
+
+    /// Shared across Changes presentations and the Agents list's row reads
+    /// for the same Host, including ones for different Agents or windows.
+    func gitExecGate(for hostID: Host.ID) -> GitExecGate {
+        if let gate = gitExecGates[hostID] { return gate }
+        let gate = GitExecGate()
+        gitExecGates[hostID] = gate
+        return gate
+    }
+
+    /// The Changes view's listing for one untracked directory. Uncached, like
+    /// the document itself: the expansion lives only in the view's store.
+    func listUntrackedDirectory(
+        _ request: UntrackedDirectoryRequest, on hostID: Host.ID
+    ) async throws -> UntrackedDirectoryListing {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.listUntrackedDirectory(request)
+        }
+    }
+
+    /// The Changes view's and the Agents list's data source: one git read
+    /// over the Host's live Console connection. Uncached: each document
+    /// lives only in the store that asked for it.
+    func readChanges(
+        _ request: ChangesReadRequest, on hostID: Host.ID
+    ) async throws -> CheckoutChangesRead {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.readChanges(request)
+        }
+    }
+
+    /// Reads only the open file through the Host's existing connection.
+    func readFilePatch(
+        _ request: FilePatchRequest, on hostID: Host.ID
+    ) async throws -> FilePatch {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.readFilePatch(request)
+        }
+    }
+
+    /// Composer's one-shot delivery source. Prompts borrow the Host's current
+    /// Console connection rather than dialing a parallel connection or holding
+    /// an RPC open for Agent completion.
+    func promptAgent(_ params: AgentPromptParams, on hostID: Host.ID) async throws -> Agent {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.promptAgent(params)
+        }
+    }
+
+    /// The Agent's screen as herdr renders it now, colors kept
+    /// (`agent.read`). Chat reads it around a send instead of the Attach
+    /// PTY, which it never touches.
+    func readAgentScreen(_ paneID: String, on hostID: Host.ID) async throws -> ANSIScreen {
+        let read = try await projection(for: hostID).session.withTransport { transport in
+            try await transport.readAgent(
+                AgentReadParams(source: .visible, target: paneID, format: .ansi, stripANSI: false))
+        }
+        return ANSIScreenDecoder.decode(read.text)
+    }
+
+    /// Presses keys in the Agent's program (`agent.send_keys`): a Blocked
+    /// card's answers and the Agent controls, never through the Attach PTY.
+    func sendAgentKeys(_ keys: [String], to paneID: String, on hostID: Host.ID) async throws {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.sendAgentKeys(AgentSendKeysParams(keys: keys, target: paneID))
+        }
+    }
+
+    /// Types one line of text into the Agent's pane (`pane.send_input`): a
+    /// Blocked card's note or typed answer.
+    func pasteIntoAgent(_ text: String, paneID: String, on hostID: Host.ID) async throws {
+        try await projection(for: hostID).session.withTransport { transport in
+            try await transport.sendPaneInput(PaneSendInputParams(paneID: paneID, text: text))
+        }
+    }
+
+    /// One Composer and staging per selected Agent for the lifetime of its
+    /// Host catalog entry. The Console detail may be replaced by a reconnect
+    /// placeholder; retaining the session here keeps its entirely local draft
+    /// intact.
+    func composerSession(for agent: ConsoleAgent) -> AgentComposerSession {
+        if let existing = composerSessions[agent.id] { return existing }
+        let hostID = agent.hostID
+        let composer = AgentComposerStore(
+            target: agent.agent.paneID,
+            initialStatus: agent.agent.status,
+            statusUpdates: agentStatusUpdates(for: agent.id)
+        ) { [weak self] params in
+            guard let self else { throw TransportError.cancelled }
+            return try await self.promptAgent(params, on: hostID)
+        }
+        let session = AgentComposerSession(
+            composer: composer, stageImage: imageStager(for: hostID), stageFile: fileStager(for: hostID))
+        composerSessions[agent.id] = session
+        return session
+    }
+
+    func composerStore(for agent: ConsoleAgent) -> AgentComposerStore {
+        composerSession(for: agent).composer
+    }
+
+    /// The Agent's Chat (ADR 0024), made on first use and kept while the
+    /// Agent and its Host entry last. Nil when the Host is not in the
+    /// catalog or the program has no transcript adapter.
+    func chatStore(for agent: ConsoleAgent, program: ChatProgram) -> AgentChatStore? {
+        if let existing = chatStores[agent.id], existing.program == program { return existing }
+        guard let host = projections[agent.hostID]?.host, let adapter = chatAdapter(program) else {
+            return nil
+        }
+        chatStores[agent.id]?.end()
+        let hostID = agent.hostID
+        let paneID = agent.agent.paneID
+        let store = AgentChatStore(
+            agentID: agent.id, agent: agent.agent, program: program,
+            source: AgentChatSource(
+                hostID: hostID, socketLocation: host.socketLocation,
+                files: chatHostFiles(for: hostID),
+                agentInfo: { [weak self] in
+                    guard let self else { throw TransportError.cancelled }
+                    return try await self.liveChatAgentInfo(hostID: hostID, paneID: paneID)
+                },
+                cache: chatCache, adapter: adapter,
+                cachedSession: { [weak self] agent in
+                    guard let self else { return nil }
+                    return await self.cachedChats.cachedSession(for: agent, on: host)
+                },
+                screen: BlockedScreenIO(
+                    readScreen: { [weak self] in
+                        guard let self else { throw TransportError.cancelled }
+                        return try await self.readAgentScreen(paneID, on: hostID)
+                    },
+                    sendKeys: { [weak self] keys in
+                        guard let self else { throw TransportError.cancelled }
+                        try await self.sendAgentKeys(keys, to: paneID, on: hostID)
+                    },
+                    paste: { [weak self] text in
+                        guard let self else { throw TransportError.cancelled }
+                        try await self.pasteIntoAgent(text, paneID: paneID, on: hostID)
+                    })))
+        if !isActive { store.suspend() }
+        chatStores[agent.id] = store
+        return store
+    }
+
+    /// Chat's transcript reads on the Host's live connection, resolved on
+    /// every call like `sessionFileReader(for:)`.
+    func chatHostFiles(for hostID: Host.ID) -> ChatHostFiles {
+        ChatHostFiles(
+            status: { [weak self] path in
+                guard let self else { throw TransportError.cancelled }
+                return try await liveChatHostFiles(for: hostID).status(path)
+            },
+            list: { [weak self] request in
+                guard let self else { throw TransportError.cancelled }
+                return try await liveChatHostFiles(for: hostID).list(request)
+            },
+            read: { [weak self] range in
+                guard let self else { throw TransportError.cancelled }
+                return try await liveChatHostFiles(for: hostID).read(range)
+            },
+            home: { [weak self] in
+                guard let self else { throw TransportError.cancelled }
+                return try await liveChatHostFiles(for: hostID).home()
+            })
+    }
+
+    private func liveChatHostFiles(for hostID: Host.ID) throws -> ChatHostFiles {
+        try projection(for: hostID).chatHostFiles()
+    }
+
+    private func liveChatAgentInfo(hostID: Host.ID, paneID: String) async throws -> Agent {
+        let origin = try projection(for: hostID)
+        let generation = origin.transportGeneration
+        let snapshot = origin.agentsByPane[paneID]
+        let fresh = try await origin.agentInfo(paneID: paneID)
+        guard projections[hostID] === origin, origin.transportGeneration == generation,
+            !origin.isAwaitingSnapshot else { throw TransportError.cancelled }
+        if hostPlatforms[hostID] == .posix, let snapshot,
+            origin.agentsByPane[paneID]?.agent.agentSession == snapshot.agent.agentSession,
+            origin.agentsByPane[paneID]?.agent.terminalID == snapshot.agent.terminalID,
+            origin.agentsByPane[paneID]?.agent.workspaceID == snapshot.agent.workspaceID,
+            origin.agentsByPane[paneID]?.agent.tabID == snapshot.agent.tabID {
+            cachedChats.confirm(fresh, for: snapshot, on: origin.host)
+        }
+        return fresh
+    }
+
+    /// A latest-value view of the existing `pane.agent_status_changed`
+    /// subscription for one Agent. Composer consumes it for delivery
+    /// transitions without opening another event channel.
+    func agentStatusUpdates(for id: ConsoleAgent.ID) -> AsyncStream<AgentStatusUpdate> {
+        let observerID = UUID()
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: AgentStatusUpdate.self, bufferingPolicy: .bufferingNewest(1))
+        agentStatusObservers[id, default: [:]][observerID] = continuation
+        continuation.yield(agentStatusUpdate(for: id))
+        continuation.onTermination = { [weak self] _ in
+            Task { @MainActor in
+                self?.removeAgentStatusObserver(observerID, for: id)
+            }
+        }
+        return stream
+    }
+
+    @discardableResult
+    func startAgent(
+        _ request: AgentLaunchRequest,
+        on hostID: Host.ID
+    ) async throws -> Agent {
+        try await projection(for: hostID).startAgent(request)
+    }
+
+    func refreshTerminalInventory(on hostID: Host.ID) async {
+        await projections[hostID]?.refreshTerminalInventory()
+    }
+
+    func createShellTerminal(
+        _ request: ShellTerminalCreationRequest,
+        on hostID: Host.ID
+    ) async throws -> ShellTerminalIdentity {
+        try await projection(for: hostID).createShellTerminal(request)
+    }
+
+    func createShellWorkspace(
+        _ workspace: NewWorkspaceSpec, tabLabel: String?, on hostID: Host.ID
+    ) async throws -> ShellTerminalIdentity {
+        try await projection(for: hostID).createShellWorkspace(workspace, tabLabel: tabLabel)
+    }
+
+    func recallShellTerminal(
+        forWorkspaceID workspaceID: String, on hostID: Host.ID
+    ) -> ShellTerminalIdentity? {
+        shellTerminals[ShellTerminalKey(hostID: hostID, workspaceID: workspaceID)]
+    }
+
+    func rememberShellTerminal(
+        _ identity: ShellTerminalIdentity,
+        forWorkspaceID workspaceID: String,
+        on hostID: Host.ID
+    ) {
+        shellTerminals[ShellTerminalKey(hostID: hostID, workspaceID: workspaceID)] =
+            identity
+    }
+
+    func forgetShellTerminal(
+        forWorkspaceID workspaceID: String, on hostID: Host.ID
+    ) {
+        shellTerminals[ShellTerminalKey(hostID: hostID, workspaceID: workspaceID)] = nil
+    }
+
+    func shellTerminalStillExists(
+        _ identity: ShellTerminalIdentity, on hostID: Host.ID
+    ) async throws -> Bool {
+        try await projection(for: hostID).paneExists(identity.paneID)
+    }
+
+    @discardableResult
+    func startAgentInNewWorktree(
+        _ request: AgentLaunchRequest,
+        worktree: WorktreeSpec,
+        on hostID: Host.ID
+    ) async throws -> Agent {
+        try await projection(for: hostID).startAgentInNewWorktree(request, worktree: worktree)
+    }
+
+    @discardableResult
+    func startAgentInNewWorkspace(
+        _ request: AgentLaunchRequest,
+        workspace: NewWorkspaceSpec,
+        on hostID: Host.ID
+    ) async throws -> Agent {
+        try await projection(for: hostID).startAgentInNewWorkspace(
+            request, workspace: workspace)
+    }
+
+    /// Suspends until `id` is reported by its Host's sync machinery, or the
+    /// timeout elapses. The new-agent flow (#12) opens the started Agent's
+    /// terminal, and the row it navigates to exists only once the post-start
+    /// resync lands — waiting keeps the detail column from flashing its
+    /// missing-Agent placeholder over a launch that just succeeded.
+    func waitForAgent(_ id: ConsoleAgent.ID, timeout: Duration = .seconds(5)) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while !agents.contains(where: { $0.id == id }) {
+            guard clock.now < deadline,
+                (try? await Task.sleep(for: .milliseconds(50))) != nil
+            else { return }
+        }
+    }
+
+    /// Suspends until a shell created on `hostID` is in the terminal
+    /// inventory, or the timeout elapses; nil then. Creation already
+    /// refreshes the inventory, so this only covers a snapshot that lands
+    /// late, which would otherwise open a terminal with no row behind it.
+    func waitForTerminal(
+        _ identity: ShellTerminalIdentity, on hostID: Host.ID,
+        timeout: Duration = .seconds(5)
+    ) async -> ConsoleTerminal? {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: timeout)
+        while true {
+            if let terminal = terminals.first(where: {
+                $0.hostID == hostID && $0.terminalID == identity.terminalID
+            }) {
+                return terminal
+            }
+            guard clock.now < deadline,
+                (try? await Task.sleep(for: .milliseconds(50))) != nil
+            else { return nil }
+        }
+    }
+
+    func closePane(_ paneID: String, on hostID: Host.ID) async throws {
+        try await projection(for: hostID).closePane(paneID)
+    }
+
+    /// Whether the Console row's close takes the Agent's whole tab: only
+    /// when its pane is the tab's last one. Beside other panes (shells
+    /// count), only the Agent's own pane closes.
+    func closesTab(of agent: ConsoleAgent) -> Bool {
+        agent.tabPaneCount <= 1
+    }
+
+    /// Whether the Console row's close also closes the Workspace: it takes
+    /// the whole tab and that tab is the workspace's last one (shell tabs
+    /// count), which herdr turns into a workspace close.
+    func closesWorkspaceWithTab(of agent: ConsoleAgent) -> Bool {
+        closesTab(of: agent) && agent.workspaceTabCount <= 1
+    }
+
+    /// Closes the Agent from its Console row's swipe action: its pane when
+    /// the tab holds others, otherwise the whole tab. Every agent on the
+    /// Host that closes with it loses its pin — a deliberate close must not
+    /// leave a pin that would re-pin a herdr-reused id. The projection's
+    /// resync refreshes the list.
+    func closeAgent(_ agent: ConsoleAgent) async throws {
+        let hostID = agent.hostID
+        guard closesTab(of: agent) else {
+            let paneID = agent.agent.paneID
+            try await projection(for: hostID).closePane(paneID)
+            pins.removePin(hostID: hostID, paneID: paneID)
+            rebuild()
+            return
+        }
+        let tabID = agent.agent.tabID
+        let pinnedPaneIDs = agents
+            .filter { $0.hostID == hostID && $0.agent.tabID == tabID }
+            .map(\.agent.paneID)
+            .filter { pins.isPinned(hostID: hostID, paneID: $0) }
+        try await projection(for: hostID).closeTab(tabID)
+        for paneID in pinnedPaneIDs {
+            pins.removePin(hostID: hostID, paneID: paneID)
+        }
+        rebuild()
+    }
+
+    /// Whether a Terminals row's close takes the shell's whole tab: only when
+    /// no other pane, Agent or shell, shares it.
+    func closesTab(of terminal: ConsoleTerminal) -> Bool {
+        Self.closesTab(of: terminal, terminals: terminals, agents: agents)
+    }
+
+    /// Whether that close also ends the Workspace: herdr closes a Workspace
+    /// with its last tab.
+    func closesWorkspaceWithTab(of terminal: ConsoleTerminal) -> Bool {
+        Self.closesWorkspaceWithTab(of: terminal, terminals: terminals, agents: agents)
+    }
+
+    nonisolated static func closesTab(
+        of terminal: ConsoleTerminal, terminals: [ConsoleTerminal], agents: [ConsoleAgent]
+    ) -> Bool {
+        let panes = Set(
+            terminals.filter { $0.hostID == terminal.hostID && $0.tabID == terminal.tabID }
+                .map(\.paneID)
+                + agents.filter { $0.hostID == terminal.hostID && $0.agent.tabID == terminal.tabID }
+                .map(\.agent.paneID))
+        return panes.subtracting([terminal.paneID]).isEmpty
+    }
+
+    nonisolated static func closesWorkspaceWithTab(
+        of terminal: ConsoleTerminal, terminals: [ConsoleTerminal], agents: [ConsoleAgent]
+    ) -> Bool {
+        guard closesTab(of: terminal, terminals: terminals, agents: agents) else { return false }
+        let tabs = Set(
+            terminals.filter {
+                $0.hostID == terminal.hostID && $0.workspaceID == terminal.workspaceID
+            }.map(\.tabID)
+                + agents.filter {
+                    $0.hostID == terminal.hostID && $0.agent.workspaceID == terminal.workspaceID
+                }.map(\.agent.tabID))
+        return tabs.subtracting([terminal.tabID]).isEmpty
+    }
+
+    /// Closes a shell from its Terminals row: its pane beside others, else
+    /// its tab. A retained connection to it is dropped rather than left to
+    /// expire against a pane that no longer exists.
+    func closeTerminal(_ terminal: ConsoleTerminal) async throws {
+        let projection = try projection(for: terminal.hostID)
+        if closesTab(of: terminal) {
+            try await projection.closeTab(terminal.tabID)
+        } else {
+            try await projection.closePane(terminal.paneID)
+        }
+        await terminalConnections.remove(
+            hostID: terminal.hostID,
+            identity: ShellTerminalIdentity(
+                paneID: terminal.paneID, tabID: terminal.tabID, terminalID: terminal.terminalID))
+    }
+
+    /// User-facing copy for a failed `tab.close`. `TransportError` is not a
+    /// `LocalizedError`, so `localizedDescription` would read as an opaque
+    /// Foundation code; mirror the rename path's mapping instead.
+    static func tabCloseFailureMessage(for error: any Error) -> String {
+        switch error {
+        case TransportError.sshUnreachable:
+            "The Host is not connected."
+        case TransportError.timedOut:
+            "The Host did not answer in time."
+        case let apiError as HerdrAPIError:
+            "herdr rejected the close: \(apiError.message)"
+        case TransportError.apiRejected(_, let message):
+            "herdr rejected the close: \(message)"
+        default:
+            "Closing failed: \(error)"
+        }
+    }
+
+    func listWorktrees(
+        forWorkspaceID workspaceID: String, on hostID: Host.ID
+    ) async throws -> WorktreeListResponse {
+        try await projection(for: hostID).listWorktrees(forWorkspaceID: workspaceID)
+    }
+
+    func removeWorktree(
+        _ request: WorktreeRemovalRequest, on hostID: Host.ID
+    ) async throws -> WorktreeRemovalReceipt {
+        try await projection(for: hostID).removeWorktree(request)
+    }
+
+    func focusAgent(_ paneID: String, on hostID: Host.ID) async throws {
+        try await projection(for: hostID).focusAgent(paneID)
+    }
+
+    func renameAgent(
+        _ paneID: String, name: String?, on hostID: Host.ID
+    ) async throws {
+        try await projection(for: hostID).renameAgent(paneID, name: name)
+    }
+
+    func renameWorkspace(
+        _ workspaceID: String, label: String, on hostID: Host.ID
+    ) async throws {
+        try await projection(for: hostID).renameWorkspace(workspaceID, label: label)
+    }
+
+    private func startProjection(for host: Host) {
+        let session = makeSession(
+            host,
+            HostConsoleProjection.subscriptions(paneIDs: []))
+        let projection = HostConsoleProjection(
+            host: host,
+            session: session,
+            snapshotRetryDelay: snapshotRetryDelay
+        ) { [weak self] in
+            self?.rebuild()
+        }
+        projections[host.id] = projection
+        projection.start(isActive: isActive)
+    }
+
+    private func rebuild() {
+        let current = Array(projections.values)
+        reconcileTerminalConnections(current)
+        requestChatHostPlatforms(current)
+        hostStatuses = Dictionary(
+            uniqueKeysWithValues: current.compactMap { projection in
+                projection.status.map { (projection.host.id, $0) }
+            })
+        hostStandingFailures = Dictionary(
+            uniqueKeysWithValues: current.compactMap { projection in
+                projection.standingFailure.map { (projection.host.id, $0) }
+            })
+        hostLatencies = Dictionary(
+            uniqueKeysWithValues: current.compactMap { projection in
+                projection.latency.map { (projection.host.id, $0) }
+            })
+        hostRouteIDs = Dictionary(
+            uniqueKeysWithValues: current.compactMap { projection in
+                projection.routeID.map { (projection.host.id, $0) }
+            })
+        hostSyncErrors = Dictionary(
+            uniqueKeysWithValues: current.compactMap { projection in
+                projection.syncError.map { (projection.host.id, $0) }
+            })
+        hostConnectionGenerations = Dictionary(
+            uniqueKeysWithValues: current.map {
+                ($0.host.id, $0.transportGeneration)
+            })
+        hostsAwaitingSnapshot = Set(
+            current.lazy.filter(\.isAwaitingSnapshot).map(\.host.id))
+        let nextWorkspacesByHost = Dictionary(
+            uniqueKeysWithValues: current.map {
+                ($0.host.id, $0.workspaces)
+            })
+        if workspacesByHost != nextWorkspacesByHost {
+            workspacesByHost = nextWorkspacesByHost
+        }
+        let nextRemovedWorktreesByAgent = current.reduce(into: [:]) { result, projection in
+            result.merge(projection.removedWorktreesByAgent) { _, latest in latest }
+        }
+        if removedWorktreesByAgent != nextRemovedWorktreesByAgent {
+            removedWorktreesByAgent = nextRemovedWorktreesByAgent
+        }
+        let sidebarConnections = Dictionary(uniqueKeysWithValues: current.compactMap { projection
+            -> (Host.ID, HerdrSidebarSnapshotStore.Connection)? in
+            guard isActive, projection.status == .connected, !projection.isAwaitingSnapshot,
+                let generation = hostConnectionGenerations[projection.host.id]
+            else { return nil }
+            return (projection.host.id, HerdrSidebarSnapshotStore.Connection(
+                generation: generation, revision: projection.sidebarRevision))
+        })
+        sidebarSnapshots.reconcile(sidebarConnections, transports: self) { [weak self] in
+            self?.rebuildAgentOrder()
+        }
+        let nextTerminals = current.flatMap { $0.terminalsByPane.values }.sorted { lhs, rhs in
+            if lhs.hostName != rhs.hostName { return lhs.hostName < rhs.hostName }
+            if lhs.hostID != rhs.hostID { return lhs.hostID.uuidString < rhs.hostID.uuidString }
+            if lhs.workspaceOrder != rhs.workspaceOrder {
+                return lhs.workspaceOrder < rhs.workspaceOrder
+            }
+            if lhs.tabPosition != rhs.tabPosition {
+                return (lhs.tabPosition ?? Int.max) < (rhs.tabPosition ?? Int.max)
+            }
+            if lhs.snapshotOrder != rhs.snapshotOrder {
+                return lhs.snapshotOrder < rhs.snapshotOrder
+            }
+            return lhs.paneID < rhs.paneID
+        }
+        if terminals != nextTerminals { terminals = nextTerminals }
+        rebuildAgentOrder()
+        publishAgentStatuses()
+        publishChatAgents()
+        reconcileChatCache()
+        // A reconnecting Host's empty projection is not proof its Agents
+        // exited, so their row totals stay until its snapshot says so.
+        let liveAgents = Set(agents.map(\.id))
+        let awaiting = hostsAwaitingSnapshot
+        rowChanges.retain { liveAgents.contains($0) || awaiting.contains($0.hostID) }
+    }
+
+    private func reconcileTerminalConnections(_ current: [HostConsoleProjection]) {
+        for projection in current {
+            let hostID = projection.host.id
+            let generation = projection.transportGeneration
+            if terminalTransportGenerations[hostID] != generation {
+                terminalTransportGenerations[hostID] = generation
+                Task { [weak self, weak projection] in
+                    guard let self, let projection, projections[hostID] === projection,
+                        projection.transportGeneration == generation
+                    else { return }
+                    let isCurrent: @MainActor () -> Bool = { [weak self, weak projection] in
+                        guard let self, let projection else { return false }
+                        return projections[hostID] === projection
+                            && projection.transportGeneration == generation
+                    }
+                    await terminalConnections.transportGenerationDidChange(
+                        generation, for: hostID, isCurrent: isCurrent)
+                    await agentTerminals.transportGenerationDidChange(
+                        generation, for: hostID, isCurrent: isCurrent)
+                }
+            }
+            guard !projection.isAwaitingSnapshot,
+                projection.status == .connected,
+                terminalSnapshotRevisions[hostID] != projection.sidebarRevision
+            else { continue }
+            terminalSnapshotRevisions[hostID] = projection.sidebarRevision
+            let identities = Set(
+                projection.terminalsByPane.values.filter { !$0.isAgent }.map {
+                    ShellTerminalIdentity(
+                        paneID: $0.paneID, tabID: $0.tabID, terminalID: $0.terminalID)
+                })
+            let revision = projection.sidebarRevision
+            let agents = Array(projection.agentsByPane.values)
+            let isCurrent: @MainActor () -> Bool = { [weak self, weak projection] in
+                guard let self, let projection else { return false }
+                return projections[hostID] === projection && !projection.isAwaitingSnapshot
+                    && projection.status == .connected && projection.sidebarRevision == revision
+            }
+            Task {
+                await terminalConnections.reconcile(
+                    hostID: hostID, identities: identities, isCurrent: isCurrent)
+                await agentTerminals.reconcile(hostID: hostID, agents: agents, isCurrent: isCurrent)
+            }
+        }
+    }
+
+    /// Chat needs each Host's platform before it can offer itself. Asking as
+    /// soon as a connection lists a Claude or Codex Agent means a detail
+    /// opening on Chat rarely has to show the terminal first. The answer is
+    /// usually already known to the transport, which learned it connecting.
+    private func requestChatHostPlatforms(_ current: [HostConsoleProjection]) {
+        for projection in current
+        where projection.status == .connected && !projection.isAwaitingSnapshot {
+            let hostID = projection.host.id
+            guard hostPlatformGenerations[hostID] != projection.transportGeneration,
+                projection.agentsByPane.values.contains(where: {
+                    AgentChatAvailability.mayOfferChat(for: $0.agent)
+                })
+            else { continue }
+            Task { [weak self] in await self?.resolveHostPlatform(hostID) }
+        }
+    }
+
+    /// All current terminal Panes, including Agents, across the Workspace's Tabs.
+    func terminals(on hostID: Host.ID, workspaceID: String) -> [ConsoleTerminal] {
+        terminals.filter { $0.hostID == hostID && $0.workspaceID == workspaceID }
+    }
+
+    func rowLayout(for hostID: Host.ID) -> AgentRowLayout {
+        rowLayouts.resolvedLayout(
+            for: hostID, pluginSnapshot: sidebarSnapshots.snapshot(for: hostID))
+    }
+
+    func refreshSidebarLayouts() async {
+        let current = Array(projections.values)
+        await withTaskGroup(of: Void.self) { group in
+            for projection in current {
+                group.addTask { await projection.refreshSidebarMetadata() }
+            }
+        }
+        await sidebarSnapshots.refresh(transports: self) { [weak self] in
+            self?.rebuildAgentOrder()
+        }
+    }
+
+    /// Settings' plugin requirement notes: each Host's plugin, read on its
+    /// current connection.
+    func refreshPluginStatuses(for hostIDs: [Host.ID]) async {
+        await pluginStatuses.refresh(hostIDs, transports: self)
+    }
+
+    /// Settings' Sync from plugin: one Host's layout file, on its current
+    /// connection. nil means the Host has no connection to read from.
+    func refreshSidebarLayout(for hostID: Host.ID) async -> HerdrSidebarSnapshotStore.HostState? {
+        await sidebarSnapshots.refresh(hostID, transports: self) { [weak self] in
+            self?.rebuildAgentOrder()
+        }
+    }
+
+    private func rebuildAgentOrder() {
+        let unsorted = projections.values.flatMap { $0.agentsByPane.values }
+        let sorts = Dictionary(uniqueKeysWithValues: projections.keys.compactMap { id in
+            sidebarSnapshots.snapshot(for: id).map { (id, $0.agentPanelSort) }
+        })
+        let pinRanks = Dictionary(uniqueKeysWithValues: unsorted.compactMap { agent in
+            pins.pinRank(hostID: agent.hostID, paneID: agent.agent.paneID)
+                .map { (agent.id, $0) }
+        })
+        agents = unsorted.consoleSorted(sortByHost: sorts) { pinRanks[$0.id] }
+    }
+
+    /// Live rows plus saved Chat entry points while a Host is unproven. The
+    /// separate `agents` property remains the only realtime inventory.
+    var chatDisplayAgents: [ConsoleAgent] {
+        let live = Set(agents.map(\.id))
+        let saved = projections.values.flatMap { projection -> [ConsoleAgent] in
+            guard projection.status != .connected || projection.isAwaitingSnapshot else { return [] }
+            return cachedChats.agents(on: projection.host).filter { !live.contains($0.id) }
+        }
+        return agents + saved.consoleSorted(sortByHost: [:]) { [pins] in
+            pins.pinRank(hostID: $0.id.hostID, paneID: $0.id.paneID)
+        }
+    }
+
+    func chatProgram(for agent: ConsoleAgent) -> ChatProgram? {
+        let platform = hostPlatforms[agent.hostID]
+        if let platform { return AgentChatAvailability.program(for: agent.agent, platform: platform) }
+        guard let host = projections[agent.hostID]?.host,
+            cachedChats.agents(on: host).contains(where: { $0.id == agent.id }) else { return nil }
+        return AgentChatAvailability.program(for: agent.agent, platform: .posix)
+    }
+
+    private func reconcileChatCache() {
+        for projection in projections.values {
+            let host = projection.host
+            guard isActive, projection.status == .connected, !projection.isAwaitingSnapshot else {
+                chatPrefetchTasks[host.id]?.cancel()
+                chatPrefetchTasks[host.id] = nil
+                chatPrefetched = chatPrefetched.filter { $0.key.hostID != host.id }
+                chatPrefetchRetries = chatPrefetchRetries.filter { $0.key.hostID != host.id }
+                continue
+            }
+            guard hostPlatforms[host.id] == .posix else { continue }
+            if chatCacheValidatedGenerations[host.id] != projection.transportGeneration {
+                chatCacheValidatedGenerations[host.id] = projection.transportGeneration
+                cachedChats.revalidate(on: host)
+            }
+            cachedChats.observe(Array(projection.agentsByPane.values), on: host)
+            guard chatPrefetchTasks[host.id] == nil else { continue }
+            let generation = projection.transportGeneration
+            let candidates = projection.agentsByPane.values.filter { agent in
+                guard AgentChatAvailability.mayOfferChat(for: agent.agent) else { return false }
+                return chatPrefetched[agent.id] != chatPrefetchKey(agent, generation: generation)
+            }
+            guard !candidates.isEmpty else { continue }
+            chatPrefetchTasks[host.id] = Task { [weak self, weak projection] in
+                guard let self, let projection else { return }
+                var needsRetry = false
+                for agent in candidates {
+                    guard !Task.isCancelled, isActive, projections[host.id] === projection,
+                        projection.status == .connected, !projection.isAwaitingSnapshot,
+                        projection.transportGeneration == generation else { break }
+                    guard let program = ChatProgram(rawValue: agent.agent.kind),
+                        let chat = chatStore(for: agent, program: program) else { continue }
+                    let key = chatPrefetchKey(agent, generation: generation)
+                    chatPrefetched[agent.id] = key
+                    let prefetched = await chat.prefetch()
+                    guard !Task.isCancelled else { return }
+                    let snapshot = chat.conversation
+                    let retries = chatPrefetchRetries[agent.id].flatMap { $0.key == key ? $0.count : nil } ?? 0
+                    chatPrefetchRetries[agent.id] =
+                        Self.chatPrefetchWaits(on: snapshot.phase) ? (key, retries + 1) : nil
+                    if !prefetched || snapshot.readFailure != nil
+                        || Self.chatPrefetchRetries(after: retries, phase: snapshot.phase)
+                    {
+                        chatPrefetched[agent.id] = nil
+                        needsRetry = true
+                    }
+                }
+                if needsRetry { try? await Task.sleep(for: chatPrefetchRetryDelay) }
+                guard !Task.isCancelled, projections[host.id] === projection else { return }
+                chatPrefetchTasks[host.id] = nil
+                reconcileChatCache()
+            }
+        }
+    }
+
+    /// Whether a prefetch that ended in `phase` looks again in a while: the
+    /// session or its transcript may still appear. A new conversation's file
+    /// comes only with a turn, whose status change prefetches again.
+    nonisolated static func chatPrefetchWaits(on phase: ChatConversationSnapshot.Phase) -> Bool {
+        switch phase {
+        case .locating: true
+        case .unavailable(.noSession), .unavailable(.notFound): true
+        default: false
+        }
+    }
+
+    /// Whether a prefetch that ended in `phase`, after `retries` earlier
+    /// ones for the same key, looks again. A conversation still missing
+    /// after a few looks waits for a change to its Agent, a new connection,
+    /// or its Chat, which keeps looking while it shows.
+    nonisolated static func chatPrefetchRetries(after retries: Int, phase: ChatConversationSnapshot.Phase) -> Bool {
+        chatPrefetchWaits(on: phase) && retries < 3
+    }
+
+    private func chatPrefetchKey(_ agent: ConsoleAgent, generation: UInt64) -> String {
+        "\(generation):\(agent.agent.terminalID):\(agent.agent.kind):\(agent.agent.status):\(agent.agent.agentSession?.value ?? "")"
+    }
+
+    /// Hands each Chat its Agent's latest record, and ends the Chats of
+    /// Agents a current snapshot no longer lists.
+    private func publishChatAgents() {
+        guard !chatStores.isEmpty else { return }
+        let current = Dictionary(agents.map { ($0.id, $0.agent) }) { first, _ in first }
+        for (id, store) in chatStores {
+            if let agent = current[id] {
+                store.agentDidChange(agent)
+            } else if hostStatuses[id.hostID] == .connected,
+                !hostsAwaitingSnapshot.contains(id.hostID)
+            {
+                store.end()
+                chatStores[id] = nil
+            }
+        }
+    }
+
+    private func publishAgentStatuses() {
+        for (id, observers) in agentStatusObservers {
+            let update = agentStatusUpdate(for: id)
+            for continuation in observers.values {
+                continuation.yield(update)
+            }
+        }
+    }
+
+    private func agentStatusUpdate(for id: ConsoleAgent.ID) -> AgentStatusUpdate {
+        let status = agents.first(where: { $0.id == id })?.agent.status
+        return AgentStatusUpdate(
+            status: status,
+            liveUpdatesAvailable: status != nil
+                && hostStatuses[id.hostID] == .connected
+                && !hostsAwaitingSnapshot.contains(id.hostID),
+            connectionGeneration: hostConnectionGenerations[id.hostID])
+    }
+
+    private func removeAgentStatusObserver(_ observerID: UUID, for id: ConsoleAgent.ID) {
+        agentStatusObservers[id]?[observerID] = nil
+        if agentStatusObservers[id]?.isEmpty == true {
+            agentStatusObservers[id] = nil
+        }
+    }
+}
+
+extension ConsoleStore: NotificationTransportProvider {
+    /// Notification Registration work borrows the Host's live Console
+    /// connection (#75) instead of dialing a second one; an unconnected Host
+    /// fails loudly like every other Host-scoped RPC here.
+    func withNotificationTransport<Value: Sendable>(
+        for hostID: Host.ID,
+        _ operation: @escaping @Sendable (any Transport) async throws -> Value
+    ) async throws -> Value {
+        try await projection(for: hostID).session.withTransport(operation)
+    }
+}
+
+extension ConsoleStore {
+    /// The production session factory: SSH transports built from the Host
+    /// catalog's credentials. TOFU is restricted to already-trusted
+    /// fingerprints; the Console never prompts.
+    static func sshSessionFactory(
+        connector: any TransportConnector = SSHTransportConnector(),
+        knownHosts: any KnownHostsStore = UserDefaultsKnownHostsStore.shared,
+        credentials: HostCredentialsProvider = HostCredentialsProvider(),
+        overlays: OverlayNetworkRuntime = .shared
+    ) -> @Sendable (Host, [EventSubscription]) -> EventsSession {
+        { host, subscriptions in
+            EventsSession(subscriptions: subscriptions) {
+                let resolved: SSHCredentials
+                do {
+                    resolved = try credentials.credentials(for: host)
+                } catch HostCredentialsError.passwordNotSet {
+                    throw TransportError.authenticationFailed
+                }
+                let policy = HostKeyPolicy(knownHosts: knownHosts) { _ in false }
+                return try await connector.connect(
+                    settings: SSHTransportSettings(
+                        host: host,
+                        credentials: resolved,
+                        hostKeyPolicy: policy,
+                        overlays: overlays))
+            }
+        }
+    }
+}

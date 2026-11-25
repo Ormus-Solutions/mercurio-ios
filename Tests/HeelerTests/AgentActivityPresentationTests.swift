@@ -1,0 +1,443 @@
+import SwiftUI
+import Testing
+import UIKit
+
+@testable import Mercurio
+
+@Suite("Agent activity presentation")
+struct AgentActivityPresentationTests {
+    private static let statuses: [(wire: String, palette: AgentStatus)] = [
+        ("blocked", .blocked),
+        ("done", .done),
+        ("working", .working),
+        ("unknown", .unknown),
+    ]
+
+    private func agentDetail(
+        paneID: String, status: String = "working"
+    ) -> AgentActivityDetails.AgentDetail {
+        AgentActivityDetails.AgentDetail(
+            paneID: paneID, kind: "claude", name: nil, workspace: "Mercurio", status: status,
+            title: "Task \(paneID)")
+    }
+
+    private func detailedPresentation(
+        agentCount: Int, total: AgentActivityAttributes.ContentState.Counts
+    ) -> AgentActivityPresentation {
+        let agents = (0..<agentCount).map { agentDetail(paneID: "w1:p\($0)") }
+        return .detailed(
+            details: AgentActivityDetails(hostName: "mbp", agents: agents),
+            counts: total)
+    }
+
+    @Test func freshShowsFourRowsWhenTotalIsFour() {
+        let presentation = detailedPresentation(
+            agentCount: 4, total: .init(working: 4, blocked: 0, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: false).count == 4)
+        #expect(presentation.lockScreenOverflowCount(isStale: false) == 0)
+        #expect(presentation.lockScreenTrailingCaption(isStale: false) == nil)
+    }
+
+    @Test func freshShowsFourRowsAndOverflowWhenTotalIsFive() {
+        let presentation = detailedPresentation(
+            agentCount: 5, total: .init(working: 5, blocked: 0, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: false).count == 4)
+        #expect(presentation.lockScreenOverflowCount(isStale: false) == 1)
+        #expect(presentation.lockScreenTrailingCaption(isStale: false) == "+1 more")
+    }
+
+    @Test func freshShowsFourRowsAndOverflowWhenTotalExceedsEnvelopeLimit() {
+        let presentation = detailedPresentation(
+            agentCount: 5, total: .init(working: 6, blocked: 0, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: false).count == 4)
+        #expect(presentation.lockScreenOverflowCount(isStale: false) == 2)
+        #expect(presentation.lockScreenTrailingCaption(isStale: false) == "+2 more")
+    }
+
+    @Test func staleShowsFourRowsWhenTotalIsFour() {
+        let presentation = detailedPresentation(
+            agentCount: 4, total: .init(working: 4, blocked: 0, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: true).count == 4)
+        #expect(presentation.lockScreenOverflowCount(isStale: true) == 0)
+        #expect(presentation.lockScreenTrailingCaption(isStale: true) == "May be out of date")
+    }
+
+    @Test func staleShowsFourRowsAndOverflowWhenTotalExceedsFour() {
+        let presentation = detailedPresentation(
+            agentCount: 5, total: .init(working: 5, blocked: 0, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: true).count == 4)
+        #expect(presentation.lockScreenOverflowCount(isStale: true) == 1)
+        #expect(presentation.lockScreenTrailingCaption(isStale: true) == "+1 more · May be out of date")
+    }
+
+    @Test func staleShowsAllRowsWhenTotalIsThreeOrLess() {
+        let presentation = detailedPresentation(
+            agentCount: 3, total: .init(working: 1, blocked: 1, done: 1))
+        #expect(presentation.lockScreenAgents(isStale: true).count == 3)
+        #expect(presentation.lockScreenOverflowCount(isStale: true) == 0)
+        #expect(presentation.lockScreenTrailingCaption(isStale: true) == "May be out of date")
+    }
+
+    @Test func staleCountsOnlyHasNoRowsAndNoOverflow() {
+        let presentation = AgentActivityPresentation.countsOnly(
+            counts: .init(working: 2, blocked: 1, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: true).isEmpty)
+        #expect(presentation.lockScreenOverflowCount(isStale: true) == 0)
+        #expect(presentation.lockScreenTrailingCaption(isStale: true) == "May be out of date")
+    }
+
+    @Test func freshCountsOnlyHasNoRowsOrCaption() {
+        let presentation = AgentActivityPresentation.countsOnly(
+            counts: .init(working: 2, blocked: 1, done: 0))
+        #expect(presentation.lockScreenAgents(isStale: false).isEmpty)
+        #expect(presentation.lockScreenOverflowCount(isStale: false) == 0)
+        #expect(presentation.lockScreenTrailingCaption(isStale: false) == nil)
+    }
+
+    @Test func attentionOrderPrefersBlockedThenDoneThenWorking() {
+        let allThree = AgentActivityAttributes.ContentState.Counts(
+            working: 2, blocked: 1, done: 3)
+        #expect(allThree.attentionItems.map(\.status) == ["blocked", "done", "working"])
+        #expect(allThree.attentionItems.map(\.count) == [1, 3, 2])
+
+        let doneBeforeWorking = AgentActivityAttributes.ContentState.Counts(
+            working: 2, blocked: 0, done: 1)
+        #expect(doneBeforeWorking.attentionItems.map(\.status) == ["done", "working"])
+
+        let workingOnly = AgentActivityAttributes.ContentState.Counts(
+            working: 3, blocked: 0, done: 0)
+        #expect(workingOnly.attentionItems.map(\.status) == ["working"])
+        #expect(workingOnly.attentionItems.map(\.count) == [3])
+    }
+
+    /// One status used to draw its count on both sides of the camera (2 and
+    /// 2). Its glyph now leads alone and the count trails.
+    @MainActor
+    @Test func aLoneStatusDrawsItsCountOnOneSideOfTheCamera() throws {
+        let lone = AgentActivityAttributes.ContentState.Counts(working: 2, blocked: 0, done: 0)
+        let mixed = AgentActivityAttributes.ContentState.Counts(working: 2, blocked: 1, done: 0)
+
+        let glyphAlone = try renderedWidth(AgentActivityCompactLeading(counts: lone))
+        #expect(abs(glyphAlone - AgentActivityIslandMetrics.tokenGlyph) < 0.5)
+        #expect(try renderedWidth(AgentActivityCompactTrailing(counts: lone)) > 0)
+
+        let glyphAndCount = try renderedWidth(AgentActivityCompactLeading(counts: mixed))
+        #expect(glyphAndCount > glyphAlone + 5)
+        #expect(
+            try renderedWidth(AgentActivityCompactTrailing(counts: mixed))
+                > AgentActivityIslandMetrics.tokenGlyph + 5)
+    }
+
+    @Test func narrationIncludesStatusForIslandAccessibility() {
+        let agent = agentDetail(paneID: "w1:p1", status: "blocked")
+        #expect(AgentActivityNarration.rowLabel(for: agent) == "Mercurio, Claude, blocked")
+    }
+
+    @Test func identityIgnoresCustomAgentNameAndTerminalTitle() {
+        let agent = AgentActivityDetails.AgentDetail(
+            paneID: "w1:p1", kind: "codex", name: "identityprobe", workspace: "Mercurio",
+            status: "working", title: "Developer · identityprobe")
+
+        #expect(agent.displayIdentity == "Mercurio · Codex")
+        #expect(agent.displayWorkspace == "Mercurio")
+    }
+
+    @Test func liveActivityRowsNarrateWorkspaceKindAndStatusWithoutTaskNoise() {
+        let agent = AgentActivityDetails.AgentDetail(
+            paneID: "w1:p1", kind: "claude", workspace: "Checkout",
+            status: "blocked", title: nil)
+
+        #expect(agent.displayWorkspace == "Checkout")
+        #expect(
+            AgentActivityNarration.rowLabel(for: agent)
+                == "Checkout, Claude, blocked")
+    }
+
+    @Test func lockScreenRowsUseComfortableAndDenseAppleTargetHeights() {
+        #expect(AgentActivityRowMetrics.lockScreenMinimumHeight(agentCount: 1) == 44)
+        #expect(AgentActivityRowMetrics.lockScreenMinimumHeight(agentCount: 3) == 44)
+        #expect(AgentActivityRowMetrics.lockScreenMinimumHeight(agentCount: 4) == 28)
+    }
+
+    @Test func lockScreenChromeRemainsDynamicAcrossSystemAppearances() {
+        #expect(
+            rgba(AgentActivityLockScreenChrome.backgroundColor, .light)
+                == rgba(UIColor.systemBackground, .light))
+        #expect(
+            rgba(AgentActivityLockScreenChrome.backgroundColor, .dark)
+                == rgba(UIColor.systemBackground, .dark))
+        #expect(
+            rgba(AgentActivityLockScreenChrome.actionColor, .light)
+                == rgba(UIColor.label, .light))
+        #expect(
+            rgba(AgentActivityLockScreenChrome.actionColor, .dark)
+                == rgba(UIColor.label, .dark))
+        #expect(
+            rgba(AgentActivityLockScreenChrome.backgroundColor, .light)
+                != rgba(AgentActivityLockScreenChrome.backgroundColor, .dark))
+    }
+
+    @Test func lockScreenSemanticTextRemainsDynamicAcrossSystemAppearances() {
+        let primary = UIColor(AgentActivitySemanticStyle.primary(on: .lockScreen))
+        let secondary = UIColor(AgentActivitySemanticStyle.secondary(on: .lockScreen))
+
+        #expect(rgba(primary, .light) == rgba(UIColor.label, .light))
+        #expect(rgba(primary, .dark) == rgba(UIColor.label, .dark))
+        #expect(rgba(secondary, .light) == rgba(UIColor.secondaryLabel, .light))
+        #expect(rgba(secondary, .dark) == rgba(UIColor.secondaryLabel, .dark))
+    }
+
+    @Test func lockScreenInkMatchesPaletteForEachAppearance() {
+        for (wire, palette) in Self.statuses {
+            for style in [UIUserInterfaceStyle.light, .dark] {
+                let resolved = rgba(
+                    UIColor(AgentActivityStatusStyle.ink(for: wire, on: .lockScreen)),
+                    style)
+                #expect(resolved == rgba(palette.inkUIColor, style), "\(wire) ink \(style.rawValue)")
+            }
+        }
+    }
+
+    @Test func lockScreenWashMatchesPaletteForEachAppearance() {
+        for (wire, palette) in Self.statuses {
+            for style in [UIUserInterfaceStyle.light, .dark] {
+                let resolved = rgba(
+                    UIColor(AgentActivityStatusStyle.wash(for: wire, on: .lockScreen)),
+                    style)
+                #expect(resolved == rgba(palette.tintUIColor, style), "\(wire) wash \(style.rawValue)")
+            }
+        }
+    }
+
+    @Test func islandInkStaysMochaUnderLightAppearance() {
+        for (wire, palette) in Self.statuses {
+            let resolved = rgba(
+                UIColor(AgentActivityStatusStyle.ink(for: wire, on: .island)),
+                .light)
+            #expect(
+                resolved == rgba(palette.inkUIColor, .dark),
+                "\(wire) island ink must stay Mocha")
+        }
+    }
+
+    @Test func islandWashStaysMochaUnderLightAppearance() {
+        for (wire, palette) in Self.statuses {
+            let resolved = rgba(
+                UIColor(AgentActivityStatusStyle.wash(for: wire, on: .island)),
+                .light)
+            #expect(
+                resolved == rgba(palette.tintUIColor, .dark),
+                "\(wire) island wash must stay Mocha")
+        }
+    }
+
+    @Test func unknownWireStatusMapsToMutedPaletteRole() {
+        let bogus = "haunted"
+        #expect(
+            rgba(UIColor(AgentActivityStatusStyle.ink(for: bogus, on: .lockScreen)), .light)
+                == rgba(AgentStatus.unknown.inkUIColor, .light))
+        #expect(
+            rgba(UIColor(AgentActivityStatusStyle.wash(for: bogus, on: .island)), .light)
+                == rgba(AgentStatus.unknown.tintUIColor, .dark))
+    }
+
+    @Test func configuredRowsNarrateLiteralFieldsAndStatus() {
+        var agent = agentDetail(paneID: "w1:p1", status: "blocked")
+        agent.rows = [
+            [.init(text: "**Task**"), .init(text: " · "), .init(text: "feature/one")],
+            [.init(text: "/src/Mercurio")],
+        ]
+        #expect(AgentActivityNarration.rowLabel(for: agent)
+            == "**Task** · feature/one, /src/Mercurio, blocked")
+        #expect(String(AgentActivityFields.attributedText(
+            agent.rows?[0] ?? [], rowIndex: 0, surface: .lockScreen).characters)
+            == "**Task** · feature/one")
+    }
+
+    @Test func intentionallyEmptyFieldsKeepOnlyTheStatus() {
+        var agent = agentDetail(paneID: "w1:p1", status: "blocked")
+        agent.rows = []
+        #expect(AgentActivityFields.rows(for: agent).isEmpty)
+        #expect(AgentActivityNarration.rowLabel(for: agent) == "blocked")
+    }
+
+    @Test func configuredFieldsShowAtMostThreeRows() {
+        var agent = agentDetail(paneID: "w1:p1")
+        agent.rows = (1...4).map { [.init(text: "Row \($0)")] }
+        #expect(AgentActivityFields.rows(for: agent).count == 3)
+        #expect(AgentActivityNarration.rowLabel(for: agent) == "Row 1, Row 2, Row 3, working")
+    }
+
+    @Test func threeRowCardsReserveSpaceForOverflowAndStaleness() {
+        let presentation = configuredPresentation(agentCount: 5)
+        #expect(
+            presentation.lockScreenAgents(isStale: false).map(\.paneID)
+                == ["w1:p0", "w1:p1", "w1:p2"])
+        #expect(presentation.lockScreenAgents(isStale: true).count == 3)
+        #expect(presentation.lockScreenTrailingCaption(isStale: true)
+            == "+2 more · May be out of date")
+        #expect(presentation.expandedAgents.count == 2)
+        #expect(presentation.overflowCount == 3)
+        let three = configuredPresentation(agentCount: 3)
+        #expect(three.lockScreenAgents(isStale: false).count == 3)
+        #expect(three.lockScreenAgents(isStale: true).count == 3)
+        let four = configuredPresentation(agentCount: 4)
+        #expect(four.lockScreenAgents(isStale: false).count == 3)
+        #expect(four.lockScreenTrailingCaption(isStale: false) == "+1 more")
+    }
+
+    /// The island clips its expanded content short of the 160 pt limit, which
+    /// used to cut the overflow caption in half under two three-row Agents.
+    @MainActor
+    @Test func expandedIslandRowsStayInsideTheHeightTheIslandLeavesThem() throws {
+        for count in [1, 2, 3, 5] {
+            let presentation = configuredPresentation(agentCount: count)
+            let rows = AgentActivityIslandRows(presentation: presentation, hostID: "host")
+                .frame(width: 335)
+            #expect(
+                try renderedSize(rows).height <= AgentActivityIslandMetrics.rowsHeightBudget + 0.5,
+                "\(count) agents")
+        }
+        let three = configuredPresentation(agentCount: 3)
+        #expect(three.expandedAgents.count == 2)
+        #expect(three.overflowCount == 1)
+    }
+
+    /// Larger text sizes grew the rows while the island stayed 160 pt tall.
+    @MainActor
+    @Test func expandedIslandRowsIgnoreLargerDynamicTypeSizes() throws {
+        let rows = AgentActivityIslandRows(
+            presentation: configuredPresentation(agentCount: 3), hostID: "host"
+        )
+        .frame(width: 335)
+        let standard = try renderedSize(rows.environment(\.dynamicTypeSize, .large))
+        let enlarged = try renderedSize(rows.environment(\.dynamicTypeSize, .accessibility3))
+        #expect(enlarged.height == standard.height)
+    }
+
+    @Test func threeRowCardsUseTheComfortableTargetHeight() {
+        var agent = agentDetail(paneID: "w1:p1")
+        agent.rows = [[.init(text: "1")], [.init(text: "2")], [.init(text: "3")]]
+        #expect(AgentActivityRowMetrics.minimumHeight(for: agent) == 44)
+        agent.rows = [[.init(text: "1")], [.init(text: "2")]]
+        #expect(AgentActivityRowMetrics.minimumHeight(for: agent) == 28)
+    }
+
+    @Test func styledFieldsPreserveHexColorAndSecondarySemantics() {
+        for hex in ["#abc", "#aabbcc"] {
+            #expect(rgba(UIColor(AgentActivityFields.foreground(
+                for: .init(text: "branch", fg: hex), rowIndex: 0, surface: .lockScreen)), .light)
+                == [170, 187, 204])
+        }
+        for invalid in ["red", "#ggg", "#1234", "#12345678"] {
+            #expect(rgba(UIColor(AgentActivityFields.foreground(
+                for: .init(text: "branch", fg: invalid), rowIndex: 0, surface: .lockScreen)), .light)
+                == rgba(.label, .light))
+        }
+        #expect(rgba(UIColor(AgentActivityFields.foreground(
+            for: .init(text: "directory", dim: true), rowIndex: 0, surface: .lockScreen)), .light)
+            == rgba(.secondaryLabel, .light))
+        #expect(rgba(UIColor(AgentActivityFields.foreground(
+            for: .init(text: "directory", dim: true), rowIndex: 2, surface: .lockScreen)), .light)
+            == rgba(.tertiaryLabel, .light))
+        #expect(rgba(UIColor(AgentActivityFields.foreground(
+            for: .init(text: "directory", dim: true), rowIndex: 2, surface: .island)), .light)
+            == rgba(.tertiaryLabel, .dark))
+    }
+
+    @MainActor
+    @Test func styledFieldsChangeRenderedPixelsOnBothSurfaces() throws {
+        let plain = AgentActivityDetails.Field(text: "Feature branch")
+        for surface in [AgentActivitySurface.lockScreen, .island] {
+            let baseline = try rowPixels(field: plain, surface: surface)
+            for styled in [
+                AgentActivityDetails.Field(text: plain.text, fg: "#f00"),
+                .init(text: plain.text, bold: true),
+                .init(text: plain.text, dim: true),
+            ] {
+                #expect(try rowPixels(field: styled, surface: surface) != baseline)
+            }
+        }
+    }
+
+    /// Measures the rendered banner, not `sizeThatFits`: a hosting
+    /// controller reports only the row frames' minimum heights and misses
+    /// the text, which is what let three-row cards overrun the budget.
+    @MainActor
+    @Test func threeRowBannersFitTheLockScreenHeightBudget() throws {
+        for count in [3, 4, 5] {
+            for stale in [false, true] {
+                let view = AgentActivityLockScreenView(
+                    presentation: configuredPresentation(agentCount: count),
+                    hostID: "host", isStale: stale)
+                let renderer = ImageRenderer(content: view
+                    .frame(width: 360)
+                    .environment(\.colorScheme, .light))
+                renderer.scale = 2
+                let image = try #require(renderer.uiImage)
+                let height = image.size.height
+                #expect(height <= 160, "\(count) Agents, stale=\(stale): \(height) pt")
+                // Three three-row cards are drawn, so the banner is far
+                // taller than the two-card layout (about 104 pt).
+                #expect(height > 140, "\(count) Agents, stale=\(stale): \(height) pt")
+                Attachment.record(image,
+                    named: "activity-fields-\(count)-agents-stale-\(stale)", as: .png)
+            }
+        }
+    }
+
+    private func configuredPresentation(agentCount: Int) -> AgentActivityPresentation {
+        let agents = (0..<agentCount).map { index in
+            var agent = agentDetail(paneID: "w1:p\(index)")
+            agent.rows = [
+                [.init(text: "Mercurio · Claude", bold: true)],
+                [.init(text: "Fix the sidebar")],
+                [.init(text: "/Users/developer/Mercurio", dim: true)],
+            ]
+            return agent
+        }
+        return .detailed(details: .init(hostName: "mbp", agents: agents),
+            counts: .init(working: agentCount, blocked: 0, done: 0))
+    }
+
+    @MainActor
+    private func rowPixels(field: AgentActivityDetails.Field, surface: AgentActivitySurface) throws -> Data {
+        var agent = agentDetail(paneID: "w1:p1")
+        agent.rows = [[field]]
+        let renderer = ImageRenderer(content: AgentActivityRowView(agent: agent, surface: surface)
+            .frame(width: 300, height: 50)
+            .background(surface == .lockScreen ? Color.white : Color.black)
+            .environment(\.colorScheme, surface == .lockScreen ? .light : .dark))
+        renderer.scale = 1
+        return try #require(renderer.uiImage?.pngData())
+    }
+
+    @MainActor
+    private func renderedWidth(_ view: some View) throws -> CGFloat {
+        try renderedSize(view).width
+    }
+
+    @MainActor
+    private func renderedSize(_ view: some View) throws -> CGSize {
+        let renderer = ImageRenderer(content: view.environment(\.colorScheme, .dark))
+        renderer.scale = 2
+        return try #require(renderer.uiImage).size
+    }
+
+    private func rgba(_ color: UIColor, _ style: UIUserInterfaceStyle) -> [Int] {
+        rgba(color.resolvedColor(with: UITraitCollection(userInterfaceStyle: style)))
+    }
+
+    private func rgba(_ color: UIColor) -> [Int] {
+        var red: CGFloat = 0
+        var green: CGFloat = 0
+        var blue: CGFloat = 0
+        var alpha: CGFloat = 0
+        color.getRed(&red, green: &green, blue: &blue, alpha: &alpha)
+        return [
+            Int((red * 255).rounded()),
+            Int((green * 255).rounded()),
+            Int((blue * 255).rounded()),
+        ]
+    }
+}

@@ -1,0 +1,253 @@
+# Task runner for Mercurio. Typical flows:
+#   make install                 # build Debug and run it on the connected iPhone
+#   make install-ipad            # same, on the connected iPad
+#   make bump && make testflight # interim TestFlight build, no version cut
+#   make publish                 # cut a release: see docs/guides/releasing.md
+
+PROJECT := Mercurio.xcodeproj
+SCHEME  := Mercurio
+ARCHIVE := build/Mercurio.xcarchive
+DERIVED_DEVICE ?= build/DerivedData-device
+DERIVED_SIMULATOR ?= build/DerivedData-simulator
+DERIVED ?= $(DERIVED_DEVICE)
+APP_ID  := solutions.ormus.mercurio
+SIM     ?= iPhone 17
+SIM_IPAD ?= iPad Pro 13-inch (M5)
+SIM_DESTINATION ?= platform=iOS Simulator,name=$(SIM)
+SIMULATOR_UDID ?=
+CI_APP_SHARD ?= all
+TEST_FLAGS ?=
+TEST_SELECTOR ?=
+export TEST_FLAGS TEST_SELECTOR
+BUILD_FLAGS ?=
+IOS_WATCH_DEBOUNCE ?= 1s
+
+# First physical iPhone / iPad paired with devicectl; override with
+# `make install DEVICE=<udid>` or `make install-ipad DEVICE_IPAD=<udid>`.
+# Your Apple Developer team id (10 characters), for the device targets. Not
+# needed if you ran scripts/set-signing.sh, which writes it into project.yml.
+TEAM ?=
+SIGN_FLAGS = $(if $(TEAM),DEVELOPMENT_TEAM=$(TEAM))
+
+DEVICE ?= $(shell python3 scripts/find-ios-device.py iPhone)
+DEVICE_IPAD ?= $(shell python3 scripts/find-ios-device.py iPad)
+
+.PHONY: check-team help generate resolve build test test-app test-ipad test-ci-app test-ci-package test-ci-evidence test-ci-background-build test-tools test-ci-guards test-ci-watchdog test-ci-recovery check-agent-docs check-test-membership simulator-ui build-device install install-ipad watch-ios-device sim sim-ipad build-sim sim-id archive upload testflight bump publish clean check-device check-device-ipad ssh-artifacts verify-ssh-artifacts
+
+# Command-line DERIVED overrides remain supported for either platform.
+test-app test-directory-browser-ui sim build-sim sim-id: DERIVED = $(DERIVED_SIMULATOR)
+
+help: ## Show available targets
+	@awk -F':.*## ' '/^[a-z-]+:.*## / { printf "  make %-20s %s\n", $$1, $$2 }' $(MAKEFILE_LIST)
+
+ssh-artifacts: ## Rebuild the pinned HeelerSSH XCFrameworks
+	Packages/HeelerSSH/Scripts/build-native.sh
+
+verify-ssh-artifacts: ## Verify HeelerSSH artifact hashes, slices, and policy
+	Packages/HeelerSSH/Scripts/verify-native.sh
+
+generate: ## Regenerate the Xcode project from project.yml (XcodeGen)
+	xcodegen generate
+
+resolve: generate ## Resolve pinned Swift packages into .ci/source-packages
+	xcodebuild -resolvePackageDependencies -project $(PROJECT) -scheme $(SCHEME) \
+		-clonedSourcePackagesDirPath .ci/source-packages
+
+build: check-team generate ## Build Debug for a physical device without installing
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug \
+		-destination 'generic/platform=iOS' -derivedDataPath $(DERIVED) \
+		-allowProvisioningUpdates $(SIGN_FLAGS) build
+
+test-app: generate ## Run app tests and verify execution (SIM_DESTINATION, TEST_SELECTOR, TEST_FLAGS)
+	python3 scripts/run-app-simulator-tests.py -project $(PROJECT) -scheme $(SCHEME) \
+		-destination '$(SIM_DESTINATION)' -derivedDataPath $(DERIVED) \
+		test
+
+test: test-app ## Run the app and HeelerSSH unit test suites on a simulator
+	scripts/run-heelerssh-package-tests.sh '$(SIM_DESTINATION)'
+
+# Requires a fresh New Agent form on the installed candidate.
+.PHONY: test-directory-browser-ui
+test-directory-browser-ui: ## Check first Browse presentation (SIMULATOR_UDID, requires idb)
+	@test -n "$(SIMULATOR_UDID)" || { echo "SIMULATOR_UDID is required"; exit 1; }
+	python3 scripts/test-remote-directory-browser.py --udid '$(SIMULATOR_UDID)' \
+		--output-dir '$(DERIVED)/DirectoryBrowserUI'
+
+test-ipad: ## Run the app and HeelerSSH unit test suites on the iPad simulator
+	$(MAKE) test SIM='$(SIM_IPAD)'
+
+test-ci-app: ## Run the committed-project CI app lane (CI_APP_SHARD, no generate)
+	HEELER_CI_LANE=app HEELER_CI_APP_SHARD='$(CI_APP_SHARD)' \
+		HEELER_CI_SIMULATOR_UDID='$(or $(SIMULATOR_UDID),$(HEELER_CI_SIMULATOR_UDID))' \
+		scripts/run-ci-ios-tests.sh
+
+test-ci-package: ## Run the committed-project CI SSH package lane (SIMULATOR_UDID)
+	HEELER_CI_LANE=package HEELER_CI_SIMULATOR_UDID='$(or $(SIMULATOR_UDID),$(HEELER_CI_SIMULATOR_UDID))' \
+		scripts/run-ci-ios-tests.sh
+
+.PHONY: test-ci-diagnostics test-ci-diagnostic-controls test-weak-network-proxy
+test-ci-diagnostics: ## Diagnose one scenario (HEELER_CI_DIAGNOSTIC_TARGET, optional iterations)
+	@test -n "$$HEELER_CI_DIAGNOSTIC_TARGET" || { echo "HEELER_CI_DIAGNOSTIC_TARGET is required" >&2; exit 2; }
+	HEELER_CI_LANE=app scripts/run-ci-ios-tests.sh
+
+test-weak-network-proxy: ## Test real TCP impairment, buffering, and proxy cleanup
+	python3 scripts/test-weak-network-proxy.py
+
+test-ci-diagnostic-controls: ## Verify diagnostic isolation and execution guards without Xcode
+	bash scripts/test-ci-ios-diagnostics.sh
+
+check-agent-docs: ## Check navigation links and unique ADR numbers
+	python3 scripts/check-agent-docs.py
+
+check-test-membership: ## Check that the committed project compiles every app test source
+	python3 scripts/check-test-target-membership.py
+
+test-tools: check-agent-docs check-test-membership ## Test agent tooling without Xcode or a simulator
+	python3 scripts/test-native-test-lifecycle.py
+	python3 scripts/test-check-agent-docs.py
+	python3 scripts/test-release-signing.py
+	python3 scripts/test-check-test-target-membership.py
+	python3 scripts/test-run-app-simulator-tests.py
+	python3 scripts/test-simulator-ui.py
+	python3 scripts/test-isolated-herdr-backend.py
+	sh scripts/test-source-revision.sh
+	$(MAKE) test-ci-evidence
+	$(MAKE) test-weak-network-proxy
+	$(MAKE) test-ci-diagnostic-controls
+
+test-ci-evidence: ## Test shard evidence, parameter cases, and skip provenance
+	python3 scripts/test-verify-ci-ios-evidence.py
+
+test-ci-guards: ## Test CI gate assertions without building the app (macOS)
+	scripts/test-run-ci-ios-tests-guards.sh
+
+test-ci-background-build: ## Test owned background build failure and cancellation
+	python3 scripts/test-run-ci-background-build.py
+
+test-ci-watchdog: test-ci-background-build ## Test the CI watchdog and simulator recovery (macOS)
+	scripts/test-run-with-timeout.sh
+
+test-ci-recovery: ## Test simulator recovery with fake Xcode processes (macOS)
+	scripts/test-ci-simulator-recovery.sh
+
+simulator-ui: ## Inspect simulator GUI capabilities (optional SIMULATOR_UDID)
+	python3 scripts/simulator-ui.py $(if $(SIMULATOR_UDID),--udid '$(SIMULATOR_UDID)')
+
+.PHONY: test-device-discovery
+test-device-discovery: ## Test physical-device selection and explicit overrides
+	python3 scripts/test-find-ios-device.py
+
+check-device:
+	@test -n "$(DEVICE)" || { echo "No physical iPhone found; pass DEVICE=<device identifier>"; exit 1; }
+
+check-team:
+	@test -n "$(TEAM)" || grep -qE 'DEVELOPMENT_TEAM: "?[A-Z0-9]{10}' project.yml || { \
+		echo "Signing needs your own Apple Developer team: make install TEAM=<team id>"; \
+		echo "(or run scripts/set-signing.sh once; see README, Build and install)"; exit 1; }
+
+# Builds against the concrete device so automatic signing can register it
+# in the development profile; the generic `build` target cannot.
+build-device: check-device check-team generate
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug \
+		-destination 'platform=iOS,id=$(DEVICE)' -derivedDataPath $(DERIVED) \
+		-allowProvisioningUpdates -allowProvisioningDeviceRegistration $(SIGN_FLAGS) build
+
+install: build-device ## Build Debug, install on the iPhone, and relaunch it
+	xcrun devicectl device install app --device $(DEVICE) \
+		$(DERIVED)/Build/Products/Debug-iphoneos/Mercurio.app
+	xcrun devicectl device process launch --terminate-existing --device $(DEVICE) $(APP_ID) \
+		|| echo "Installed, but the launch was refused (device locked?). Unlock it and open Mercurio."
+
+check-device-ipad:
+	@test -n "$(DEVICE_IPAD)" || { echo "No physical iPad found; pass DEVICE_IPAD=<device identifier>"; exit 1; }
+
+install-ipad: check-device-ipad ## Build Debug, install on the iPad, and relaunch it
+	$(MAKE) install DEVICE="$(DEVICE_IPAD)"
+
+watch-ios-device: ## Watch iOS code and install to a connected iPhone/iPad
+	@command -v watchexec >/dev/null || { echo "watchexec not found. Install with: brew install watchexec"; exit 1; }
+	watchexec \
+		--watch Sources \
+		--watch Packages/HeelerSSH/Sources \
+		--watch Packages/HeelerSSH/NativeSupport \
+		--watch Packages/HeelerSSH/Package.swift \
+		--watch project.yml \
+		--exts swift,h,modulemap,yml,plist,xcprivacy,entitlements,resolved,json,png,ttf \
+		--debounce "$(IOS_WATCH_DEBOUNCE)" \
+		--on-busy-update queue \
+		-- make install DEVICE="$(DEVICE)"
+
+sim: generate ## Build Debug and run it on the simulator (override with SIM=<name>)
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug \
+		-destination 'platform=iOS Simulator,name=$(SIM)' -derivedDataPath $(DERIVED) build
+	xcrun simctl boot '$(SIM)' 2>/dev/null || true
+	@if [ -d /Applications/Xcode.app/Contents/Developer/Applications/Simulator.app ] \
+		|| [ -d /Applications/Xcode.app/Contents/Applications/Simulator.app ]; then \
+		open -a Simulator; \
+	else \
+		open /Applications/Xcode.app/Contents/Applications/DeviceHub.app; \
+	fi
+	xcrun simctl install booted $(DERIVED)/Build/Products/Debug-iphonesimulator/Mercurio.app
+	xcrun simctl launch --terminate-running-process booted $(APP_ID)
+
+sim-ipad: ## Build Debug and run it on the iPad simulator (override with SIM_IPAD=<name>)
+	$(MAKE) sim SIM='$(SIM_IPAD)'
+
+build-sim: generate ## Build Debug for SIM_DESTINATION using .ci/source-packages
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Debug \
+		-destination '$(SIM_DESTINATION)' -derivedDataPath $(DERIVED) \
+		-clonedSourcePackagesDirPath .ci/source-packages $(BUILD_FLAGS) build
+
+sim-id: build-sim ## Install and launch the app on SIMULATOR_UDID only
+	@test -n "$(SIMULATOR_UDID)" || { echo "SIMULATOR_UDID is required; pass SIMULATOR_UDID=<uuid>"; exit 1; }
+	@case '$(SIM_DESTINATION)' in \
+	  *booted*) echo "sim-id refuses a generic booted destination"; exit 1 ;; \
+	  *id=$(SIMULATOR_UDID)*) ;; \
+	  *) echo "SIM_DESTINATION must include id=$(SIMULATOR_UDID) (got '$(SIM_DESTINATION)')"; exit 1 ;; \
+	esac
+	xcrun simctl boot '$(SIMULATOR_UDID)' 2>/dev/null || true
+	xcrun simctl bootstatus '$(SIMULATOR_UDID)' -b
+	xcrun simctl install '$(SIMULATOR_UDID)' $(DERIVED)/Build/Products/Debug-iphonesimulator/Mercurio.app
+	xcrun simctl launch --terminate-running-process '$(SIMULATOR_UDID)' $(APP_ID)
+
+archive: generate ## Archive a Release build for distribution
+	@# HEELER_SOURCE_REVISION names the commit in About › Acknowledgements;
+	@# empty unless HEAD is pushed and only the build number is uncommitted.
+	xcodebuild -project $(PROJECT) -scheme $(SCHEME) -configuration Release \
+		-destination 'generic/platform=iOS' -archivePath $(ARCHIVE) \
+		-allowProvisioningUpdates $(SIGN_FLAGS) MERCURIO_SOURCE_REVISION=$$(scripts/source-revision.sh) archive
+
+upload: ## Upload the existing archive to App Store Connect (TestFlight)
+	xcodebuild -exportArchive -archivePath $(ARCHIVE) \
+		-exportOptionsPlist scripts/ExportOptions.plist \
+		-exportPath build/export -allowProvisioningUpdates
+
+testflight: archive upload ## Archive and upload in one go
+
+bump: ## Increment CURRENT_PROJECT_VERSION in project.yml (app + extension stay in lockstep)
+	@# Anchor to the setting itself: an unanchored match also hits the
+	@# `CFBundleVersion: $$(CURRENT_PROJECT_VERSION)` plist line, which carries no
+	@# quotes, so `$$2` came back empty and every target was reset to "1". Guard
+	@# the parse and the rewrite the way scripts/publish.sh does.
+	@CUR=$$(awk -F'"' '/^ *CURRENT_PROJECT_VERSION:/ { print $$2; exit }' project.yml); \
+	case "$$CUR" in \
+	  '' | *[!0-9]*) echo "CURRENT_PROJECT_VERSION '$$CUR' is not an integer" >&2; exit 1 ;; \
+	esac; \
+	LINES=$$(grep -c '^ *CURRENT_PROJECT_VERSION:' project.yml); \
+	NEW=$$((CUR + 1)); \
+	sed -i '' -E "s/^( *CURRENT_PROJECT_VERSION: )\"[0-9]+\"/\1\"$$NEW\"/" project.yml; \
+	test "$$(grep -c "^ *CURRENT_PROJECT_VERSION: \"$$NEW\"$$" project.yml)" = "$$LINES" \
+	  || { echo "CURRENT_PROJECT_VERSION was not rewritten in all $$LINES targets" >&2; exit 1; }; \
+	echo "CURRENT_PROJECT_VERSION: $$CUR -> $$NEW"
+	@# Regenerate immediately so the tracked pbxproj changes with project.yml
+	@# and one commit carries both (otherwise the next make target regenerates
+	@# it after the bump commit and leaves it dirty).
+	@$(MAKE) generate
+
+# Options are make variables, not flags: make eats `--dry-run` as its own -n and
+# rejects unknown long options, so a flag would never reach the recipe.
+publish: ## Cut a release from CHANGELOG [Unreleased] (VERSION=x.y.z DRY_RUN=1 YES=1)
+	@VERSION='$(VERSION)' DRY_RUN='$(DRY_RUN)' YES='$(YES)' scripts/publish.sh
+
+clean: ## Remove local build products
+	rm -rf build

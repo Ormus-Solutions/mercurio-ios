@@ -1,0 +1,2740 @@
+import Foundation
+import Observation
+import Synchronization
+import Testing
+
+@testable import Mercurio
+
+/// Console state store (#8) against scripted transports: snapshot-then-delta
+/// sync, Blocked-first sorting, membership resyncs, and snippets — protocol
+/// level, no SSH.
+@MainActor
+@Suite("Console store")
+struct ConsoleStoreTests {
+    /// Reconnect fast so resync tests never wait on real backoff.
+    private static nonisolated let fastPolicy = ReconnectPolicy(
+        initialDelay: .milliseconds(10), multiplier: 2, maxDelay: .milliseconds(50))
+
+    /// A store whose session factory routes each Host to its scripted
+    /// transport; unknown Hosts fail the connect. Pins default to an isolated
+    /// suite so leftover `UserDefaults.standard` data cannot reorder the list.
+    private func makeStore(
+        transports: [Host.ID: ScriptedTransport],
+        reconnectPolicy: ReconnectPolicy = Self.fastPolicy,
+        pins: PinnedAgentsStore? = nil
+    ) -> ConsoleStore {
+        let resolvedPins =
+            pins
+            ?? PinnedAgentsStore(
+                defaults: UserDefaults(suiteName: "hm-console-pins-\(UUID().uuidString)")
+                    ?? .standard)
+        return ConsoleStore(
+            snapshotRetryDelay: .milliseconds(10), pins: resolvedPins
+        ) { host, subscriptions in
+            EventsSession(
+                subscriptions: subscriptions,
+                connect: {
+                    guard let transport = transports[host.id] else {
+                        throw TransportError.sshUnreachable(detail: "unscripted host")
+                    }
+                    return transport
+                },
+                reconnectPolicy: reconnectPolicy,
+                keepalive: nil)
+        }
+    }
+
+    private func consoleAgent(
+        hostID: UUID,
+        hostName: String,
+        paneID: String,
+        status: AgentStatus,
+        workspaceLabel: String? = "Proj",
+        workspaceTabCount: Int = 0,
+        tabPaneCount: Int = 1
+    ) -> ConsoleAgent {
+        ConsoleAgent(
+            hostID: hostID,
+            hostName: hostName,
+            agent: Agent(.fixture(paneID: paneID, status: status)),
+            workspaceLabel: workspaceLabel,
+            repositoryCheckout: nil,
+            workspaceTabCount: workspaceTabCount,
+            tabPaneCount: tabPaneCount)
+    }
+
+    @Test func theLastTabInAWorkspaceAsksBeforeClosingIt() {
+        // (#swipe): the confirmation only stands between the swipe and a
+        // close when the tab is the workspace's last one — closing it takes
+        // the workspace down with it.
+        let host = Host.fixture()
+        let store = makeStore(transports: [:])
+        let last = consoleAgent(
+            hostID: host.id, hostName: host.name, paneID: "w1:p1",
+            status: .idle, workspaceTabCount: 1)
+        let shared = consoleAgent(
+            hostID: host.id, hostName: host.name, paneID: "w1:p2",
+            status: .idle, workspaceTabCount: 3)
+
+        #expect(store.closesWorkspaceWithTab(of: last))
+        #expect(!store.closesWorkspaceWithTab(of: shared))
+    }
+
+    @Test func aTabWithOtherPanesClosesOnlyTheAgentsPane() {
+        // The row's close takes the whole tab only when the Agent's pane is
+        // its last; beside a split it closes just that pane, so even the
+        // workspace's last tab keeps the workspace alive.
+        let host = Host.fixture()
+        let store = makeStore(transports: [:])
+        let alone = consoleAgent(
+            hostID: host.id, hostName: host.name, paneID: "w1:p1",
+            status: .idle, workspaceTabCount: 1, tabPaneCount: 1)
+        let split = consoleAgent(
+            hostID: host.id, hostName: host.name, paneID: "w1:p2",
+            status: .idle, workspaceTabCount: 1, tabPaneCount: 2)
+
+        #expect(store.closesTab(of: alone))
+        #expect(!store.closesTab(of: split))
+        #expect(!store.closesWorkspaceWithTab(of: split))
+    }
+
+    private func makePinDefaults() throws -> (UserDefaults, cleanup: () -> Void) {
+        let suiteName = "hm-console-pins-\(UUID().uuidString)"
+        let defaults = try #require(UserDefaults(suiteName: suiteName))
+        return (defaults, { defaults.removePersistentDomain(forName: suiteName) })
+    }
+
+    /// Polls until `condition` holds, yielding so the store's tasks progress.
+    private func waitUntil(
+        _ comment: Comment, timeout: Duration = .seconds(5),
+        condition: () async -> Bool
+    ) async throws {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if await condition() { break }
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        #expect(await condition(), comment)
+    }
+
+    @Test func removingAHostDropsItsChatCache() async throws {
+        let cache = VolatileChatTranscriptCache()
+        let kept = Host.fixture()
+        let removed = Host.fixture()
+        let store = ConsoleStore(snapshotRetryDelay: .milliseconds(10), chatCache: cache) {
+            _, subscriptions in
+            EventsSession(
+                subscriptions: subscriptions,
+                connect: { throw TransportError.sshUnreachable(detail: "unscripted host") },
+                keepalive: nil)
+        }
+        func key(_ host: Host) -> ChatCacheKey {
+            ChatCacheKey(
+                hostID: host.id, herdrSession: "", program: .codex,
+                conversationID: "01a10f87-e025-7fb1-8974-8dd09937767a")
+        }
+        for host in [kept, removed] {
+            await cache.save(
+                ChatCacheDocument(
+                    key: key(host), adapterRevision: 1, transcriptPath: "/r.jsonl", head: Data(),
+                    coverageStart: 0, coverageEnd: 0, reachedStart: true, title: nil, entries: [],
+                    savedAt: Date()))
+        }
+
+        store.setHosts([kept, removed])
+        store.setHosts([kept])
+
+        try await waitUntil("the removed Host's Chat cache is deleted") {
+            await cache.load(key(removed)) == .miss
+        }
+        #expect(await cache.load(key(kept)) != .miss)
+        store.setHosts([])
+    }
+
+    /// A new Pi or Oh My Pi conversation has no file until its first turn,
+    /// whose status change prefetches again: looking every few seconds in
+    /// between would find nothing.
+    @Test func awaitingFirstMessageDoesNotRetryPrefetch() {
+        #expect(!ConsoleStore.chatPrefetchWaits(on: .unavailable(.awaitingFirstMessage(.pi))))
+        #expect(!ConsoleStore.chatPrefetchWaits(on: .unavailable(.awaitingFirstMessage(.omp))))
+        #expect(ConsoleStore.chatPrefetchWaits(on: .unavailable(.notFound(searchedAll: true))))
+        #expect(ConsoleStore.chatPrefetchWaits(on: .unavailable(.noSession(.pi))))
+        #expect(ConsoleStore.chatPrefetchWaits(on: .locating))
+        #expect(!ConsoleStore.chatPrefetchWaits(on: .following(path: "/p.jsonl")))
+    }
+
+    /// A conversation still missing after a few looks waits for a change
+    /// to its Agent instead of sweeping the Host every few seconds while
+    /// its Chat is hidden (SR-02).
+    @Test(arguments: [
+        ChatConversationSnapshot.Phase.unavailable(.notFound(searchedAll: true)), .unavailable(.noSession(.claude)),
+    ])
+    func aMissingConversationStopsPrefetchingAfterThreeRetries(phase: ChatConversationSnapshot.Phase) {
+        #expect((0...4).map { ConsoleStore.chatPrefetchRetries(after: $0, phase: phase) }
+            == [true, true, true, false, false])
+        #expect(!ConsoleStore.chatPrefetchRetries(after: 0, phase: .following(path: "/p.jsonl")))
+    }
+
+    @Test func aStatusChangeRearmsAStoppedPrefetch() async throws {
+        let host = Host.fixture()
+        let session = AgentSessionInfo(
+            agent: "claude", kind: .id, source: "herdr:claude", value: "e951205e-24af-4a5e-baa7-3ccbebd2de2c")
+        let info = AgentInfo(
+            agentStatus: .idle, focused: false, paneID: "w1:p1", revision: 1,
+            tabID: "t1", terminalID: "term-1", workspaceID: "w1", agent: "claude",
+            agentSession: session, cwd: "/home/dev/proj")
+        let transport = ScriptedTransport(snapshot: .fixture(agents: [info]))
+        // No transcript under the session's name.
+        await transport.scriptChat(files: VirtualHostFiles().hostFiles(), agent: Agent(info))
+        let store = ConsoleStore(
+            snapshotRetryDelay: .milliseconds(10), chatPrefetchRetryDelay: .milliseconds(10),
+            makeSession: { _, subscriptions in
+                EventsSession(
+                    subscriptions: subscriptions, connect: { transport },
+                    reconnectPolicy: Self.fastPolicy, keepalive: nil)
+            }, chatAdapter: { _ in NumberedChatReducer.adapter() })
+        defer { store.setHosts([]) }
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the first look and three retries") { await transport.chatAgentReads.count == 4 }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(await transport.chatAgentReads.count == 4)
+
+        await transport.setSnapshot(.fixture(agents: [AgentInfo(
+            agentStatus: .working, focused: false, paneID: "w1:p1", revision: 2,
+            tabID: "t1", terminalID: "term-1", workspaceID: "w1", agent: "claude",
+            agentSession: session, cwd: "/home/dev/proj")]))
+        try await waitUntil("the status event lands") {
+            _ = await transport.emit(.agentStatusChanged(paneID: "w1:p1", status: .working))
+            return store.agents.first?.agent.status == .working
+        }
+        try await waitUntil("the new status looks again") { await transport.chatAgentReads.count == 8 }
+        try await Task.sleep(for: .milliseconds(300))
+        #expect(await transport.chatAgentReads.count == 8)
+    }
+
+    @Test func connectingCachesChatWithoutOpeningItsDetail() async throws {
+        let host = Host.fixture()
+        let sessionID = "e951205e-24af-4a5e-baa7-3ccbebd2de2c"
+        let session = AgentSessionInfo(
+            agent: "claude", kind: .id, source: "herdr:claude", value: sessionID)
+        let info = AgentInfo(
+            agentStatus: .idle, focused: false, paneID: "w1:p1", revision: 1,
+            tabID: "t1", terminalID: "term-1", workspaceID: "w1", agent: "claude",
+            agentSession: session, cwd: "/home/dev/proj")
+        let transport = ScriptedTransport(snapshot: .fixture(agents: [info]))
+        let files = VirtualHostFiles()
+        let path = "/home/dev/.claude/projects/-home-dev-proj/\(sessionID).jsonl"
+        await files.write(NumberedChatReducer.lines(0..<3), at: path)
+        await transport.scriptChat(files: files.hostFiles(), agent: Agent(info))
+        let root = FileManager.default.temporaryDirectory.appending(
+            path: "ConsoleChatPrefetch-\(UUID().uuidString)", directoryHint: .isDirectory)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let cache = FileChatTranscriptCache(root: root)
+        let store = ConsoleStore(
+            snapshotRetryDelay: .milliseconds(10), chatCache: cache,
+            makeSession: { _, subscriptions in
+                EventsSession(
+                    subscriptions: subscriptions, connect: { transport },
+                    reconnectPolicy: Self.fastPolicy, keepalive: nil)
+            }, chatAdapter: { _ in NumberedChatReducer.adapter() })
+        let key = ChatCacheKey(
+            hostID: host.id, socketLocation: host.socketLocation,
+            reference: ConversationReference(program: .claude, sessionID: sessionID))
+
+        store.setHosts([host])
+        await store.resume()
+        // No detail, chatStore, show or prefetch call: connecting owns this work.
+        try await waitUntil("connecting should persist the unread Chat conversation") {
+            guard case .hit(let document) = await cache.load(key) else { return false }
+            return document.entries.map(\.id.rawValue) == NumberedChatReducer.ids(0..<3)
+        }
+        #expect(store.hostPlatforms[host.id] == .posix)
+        #expect(!store.hostsAwaitingSnapshot.contains(host.id))
+        #expect(await transport.chatAgentReads.count > 0)
+        #expect(await files.reads.contains { $0.path == path })
+        await store.cachedChats.settled()
+        await store.suspend()
+
+        // A new cache actor proves both the page and its entry point were
+        // written to disk, rather than retained only in the first store.
+        let reopened = FileChatTranscriptCache(root: root)
+        guard case .hit(let document) = await reopened.load(key) else {
+            Issue.record("the prefetched conversation should survive relaunch")
+            store.setHosts([])
+            return
+        }
+        #expect(document.entries.map(\.id.rawValue) == NumberedChatReducer.ids(0..<3))
+        let directory = await reopened.loadAgentDirectory(for: host)
+        #expect(directory.map(\.paneID) == ["w1:p1"])
+        #expect(directory.first?.agentSession == session)
+        store.setHosts([])
+    }
+
+    /// The user can trust a replaced host key without editing the Host; the
+    /// reconnect that follows must not hand the old machine's saved Chat
+    /// binding to a live Agent that has not reported its session.
+    @Test func reconnectingAfterAReplacedHostKeyDropsSavedChatBindings() async throws {
+        let host = Host.fixture()
+        let info = AgentInfo(
+            agentStatus: .idle, focused: false, paneID: "w1:p1", revision: 1,
+            tabID: "t1", terminalID: "term-1", workspaceID: "w1", agent: "claude",
+            agentSession: nil, cwd: "/home/dev/proj")
+        let savedSession = AgentSessionInfo(
+            agent: "claude", kind: .id, source: "herdr:claude",
+            value: "e951205e-24af-4a5e-baa7-3ccbebd2de2c")
+        let saved = Agent(AgentInfo(
+            agentStatus: .idle, focused: false, paneID: "w1:p1", revision: 1,
+            tabID: "t1", terminalID: "term-1", workspaceID: "w1", agent: "claude",
+            agentSession: savedSession, cwd: "/home/dev/proj"))
+        let knownHosts = InMemoryKnownHostsStore()
+        let trust = HostKeyTrust.hostKey(host.id)
+        func trustKey(_ byte: UInt8) async {
+            await knownHosts.setFingerprint(
+                HostKeyFingerprint(digest: Data(repeating: byte, count: 32), algorithm: "ssh-ed25519"),
+                host: trust.host, port: trust.port)
+        }
+        await trustKey(1)
+        let cache = VolatileChatTranscriptCache(knownHosts: knownHosts)
+        await cache.saveAgentDirectory(
+            [ChatCachedAgent(ConsoleAgent(
+                hostID: host.id, hostName: host.displayName, agent: saved,
+                workspaceLabel: nil, repositoryCheckout: nil))],
+            for: host)
+        let transport = ScriptedTransport(snapshot: .fixture(agents: [info]))
+        let store = ConsoleStore(
+            snapshotRetryDelay: .milliseconds(10), chatCache: cache,
+            makeSession: { _, subscriptions in
+                EventsSession(
+                    subscriptions: subscriptions, connect: { transport },
+                    reconnectPolicy: Self.fastPolicy, keepalive: nil)
+            })
+        defer { store.setHosts([]) }
+        let live = Agent(info)
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the first connection should keep the saved binding") {
+            await store.cachedChats.settled()
+            return await store.cachedChats.cachedSession(for: live, on: host) == savedSession
+        }
+
+        await trustKey(2)
+        await transport.failEventStream(.channelFailed(detail: "scripted reconnect"))
+        try await waitUntil("the reconnect should drop the other machine's binding") {
+            await store.cachedChats.settled()
+            guard store.hostStatuses[host.id] == .connected else { return false }
+            return await store.cachedChats.cachedSession(for: live, on: host) == nil
+        }
+        #expect(await cache.loadAgentDirectory(for: host).isEmpty)
+    }
+
+    /// #414, the app's removal wiring end to end: the revoke borrows the
+    /// Host's live Console connection, which the catalog change then ends,
+    /// so a revoke attempted after it could no longer reach the Host.
+    @Test func hostRemovalRevokesOverTheConnectionTheCatalogChangeEnds() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture(agents: []))
+        let console = makeStore(transports: [host.id: transport])
+        defer { console.setHosts([]) }
+        let (defaults, cleanup) = try makePinDefaults()
+        defer { cleanup() }
+        let hostStore = HostStore(defaults: defaults, secrets: InMemorySecretStore())
+        try hostStore.add(host)
+        let token = APNSDeviceToken(hex: "0a1b2c3d", environment: .sandbox)
+        let keys = NotificationKeyStore(secrets: InMemorySecretStore(), mirror: nil)
+        let ceremony = NotificationRegistrationCeremony(keys: keys)
+        let preferences = NotificationPreferencesStore(
+            transports: console, deviceToken: { token }, ceremony: ceremony)
+        preferences.setHosts(hostStore.hosts)
+        let liveActivities = HostLiveActivityCoordinator(
+            controller: FakeLiveActivityController(),
+            preferences: LiveActivityPreferences(defaults: defaults),
+            transports: console,
+            keys: keys,
+            deviceToken: { token },
+            knownHostIDs: { Set(hostStore.hosts.map(\.id)) },
+            hostDisplayName: { _ in host.displayName },
+            isAwaitingSnapshot: { _ in false },
+            connectionStatus: { console.hostStatuses[$0] })
+        console.setHosts(hostStore.hosts)
+        await console.resume()
+        try await waitUntil("the Host should connect") {
+            console.hostStatuses[host.id] == .connected
+        }
+        try await ceremony.register(host: host, deviceToken: token, over: transport)
+        let dependencies = HostRemovalDependencies.app(
+            console: console, notificationPreferences: preferences,
+            liveActivities: liveActivities)
+        let removal = HostRemovalStore(store: hostStore)
+
+        removal.requestRemoval([host.id], dependencies: dependencies)
+        let request = try #require(removal.pendingRequest)
+        #expect(request.deletesNotificationKey)
+        #expect(!request.leavesNotificationsBehind)
+        await removal.confirmRemoval(request, dependencies: dependencies)
+
+        #expect(hostStore.hosts.isEmpty)
+        #expect(removal.errorMessage == nil)
+        #expect(try keys.record(forHost: host.id) == nil)
+        let file = try NotificationRegistrationFile.decode(
+            await transport.notificationRegistration)
+        #expect(file.devices.isEmpty)
+
+        // What the app model's catalog observer does next.
+        console.setHosts(hostStore.hosts)
+        await #expect(throws: (any Error).self) {
+            try await console.withNotificationTransport(for: host.id) { _ in () }
+        }
+    }
+
+    @Test func sortBucketsRankBlockedThenDoneThenWorkingThenIdle() {
+        #expect(AgentStatus.blocked.consoleSortBucket < AgentStatus.done.consoleSortBucket)
+        #expect(AgentStatus.done.consoleSortBucket < AgentStatus.working.consoleSortBucket)
+        #expect(AgentStatus.working.consoleSortBucket < AgentStatus.idle.consoleSortBucket)
+        #expect(AgentStatus.idle.consoleSortBucket < AgentStatus.unknown.consoleSortBucket)
+        // herdr's API has no stability guarantee: a status this build does
+        // not recognize must land in the bottom bucket, not on top.
+        #expect(
+            AgentStatus(rawValue: "haunted").consoleSortBucket
+                == AgentStatus.unknown.consoleSortBucket)
+    }
+
+    @Test func consoleSortedPutsPinnedAgentsFirstByRank() {
+        let hostA = UUID()
+        let hostB = UUID()
+        let idle = consoleAgent(
+            hostID: hostA, hostName: "alpha", paneID: "w1:p1", status: .idle)
+        let working = consoleAgent(
+            hostID: hostA, hostName: "alpha", paneID: "w1:p2", status: .working)
+        let blocked = consoleAgent(
+            hostID: hostB, hostName: "beta", paneID: "w2:p1", status: .blocked)
+        let done = consoleAgent(
+            hostID: hostB, hostName: "beta", paneID: "w2:p2", status: .done)
+        let agents = [idle, working, blocked, done]
+        // Unpinned order is blocked > done > working > idle.
+        #expect(agents.consoleSorted().map(\.agent.paneID) == ["w2:p1", "w2:p2", "w1:p2", "w1:p1"])
+
+        // idle pinned first (rank 1), working pinned more recently (rank 0).
+        // Unpinned blocked/done keep their relative order.
+        let ranks: [ConsoleAgent.ID: Int] = [idle.id: 1, working.id: 0]
+        #expect(
+            agents.consoleSorted { ranks[$0.id] }.map(\.agent.paneID)
+                == ["w1:p2", "w1:p1", "w2:p1", "w2:p2"])
+    }
+
+    @Test func consoleSortedLeavesUnpinnedTiebreaksUnchanged() {
+        let hostA = UUID()
+        let hostB = UUID()
+        // Same status: Host name, then host id, then workspace, then pane id.
+        let laterName = consoleAgent(
+            hostID: hostA, hostName: "zeta", paneID: "w1:p1", status: .working)
+        let earlierName = consoleAgent(
+            hostID: hostB, hostName: "alpha", paneID: "w2:p1", status: .working)
+        let unpinned = [laterName, earlierName].consoleSorted()
+        #expect(unpinned.map(\.agent.paneID) == ["w2:p1", "w1:p1"])
+
+        let ranks: [ConsoleAgent.ID: Int] = [laterName.id: 0]
+        let pinned = [laterName, earlierName].consoleSorted { ranks[$0.id] }
+        #expect(pinned.map(\.agent.paneID) == ["w1:p1", "w2:p1"])
+    }
+
+    @Test func snapshotsAcrossHostsFlattenIntoOneStatusSortedList() async throws {
+        let hostA = Host.fixture(name: "alpha", address: "a.example")
+        let hostB = Host.fixture(name: "beta", address: "b.example")
+        let transports = [
+            hostA.id: ScriptedTransport(
+                snapshot: .fixture(
+                    agents: [
+                        .fixture(paneID: "w1:p1", status: .idle),
+                        .fixture(paneID: "w1:p2", status: .working),
+                    ],
+                    workspaces: [.fixture(workspaceID: "w1", label: "Proj", repoName: "proj")])),
+            hostB.id: ScriptedTransport(
+                snapshot: .fixture(
+                    agents: [
+                        .fixture(paneID: "w2:p1", status: .blocked, workspaceID: "w2"),
+                        .fixture(paneID: "w2:p2", status: .done, workspaceID: "w2"),
+                    ],
+                    workspaces: [.fixture(workspaceID: "w2", label: "Api")])),
+        ]
+        let store = makeStore(transports: transports)
+
+        store.setHosts([hostA, hostB])
+        await store.resume()
+        try await waitUntil("all four agents should arrive") { store.agents.count == 4 }
+
+        // Blocked > Done > Working > Idle, flat across both Hosts.
+        #expect(store.agents.map(\.agent.paneID) == ["w2:p1", "w2:p2", "w1:p2", "w1:p1"])
+        #expect(store.agents.first?.hostName == "beta")
+        // Workspace rides along as a context tag.
+        #expect(store.agents.first?.workspaceLabel == "Api")
+        #expect(store.agents[1].workspaceLabel == "Api")
+        #expect(store.agents.last?.repoName == "proj")
+
+        store.setHosts([])
+    }
+
+    @Test func snapshotProjectionJoinsTabsAndPreservesSidebarFacts() async throws {
+        func tab(_ workspace: String, label: String, number: Int, suffix: String = "t1") -> TabInfo {
+            TabInfo(agentStatus: .idle, focused: false, label: label, number: number,
+                    paneCount: 1, tabID: "\(workspace):\(suffix)", workspaceID: workspace)
+        }
+        let host = Host.fixture()
+        let single = tab("single", label: "1", number: 42)
+        let snapshot = SessionSnapshot(
+            agents: [
+                AgentInfo(agentStatus: .working, focused: false, paneID: "single:p", revision: 1,
+                          tabID: "single:t1", terminalID: "terminal", workspaceID: "single", agent: "claude",
+                          stateChangeSeq: 7, stateLabels: ["working": "Busy"], terminalTitle: "◑ Task",
+                          terminalTitleStripped: "Task", title: "Pane title", tokens: ["pin_icon": "📌"]),
+                .fixture(paneID: "multi:p", workspaceID: "multi"),
+                .fixture(paneID: "named:p", workspaceID: "named"),
+                .fixture(paneID: "missing:p", workspaceID: "missing"),
+            ], layouts: [], panes: [
+                PaneInfo(agentStatus: .idle, focused: false, paneID: "multi:p", revision: 1,
+                         tabID: "multi:t1", terminalID: "term", workspaceID: "multi", label: "Manual label"),
+                PaneInfo(agentStatus: .working, focused: false, paneID: "single:p", revision: 1,
+                         tabID: "single:t1", terminalID: "term", workspaceID: "single", label: "Fallback"),
+            ], protocolVersion: 20,
+            tabs: [single, single, tab("multi", label: "1", number: 8),
+                   tab("named", label: "2", number: 2),
+                   tab("multi", label: "Shell", number: 9, suffix: "shell")],
+            version: "0.8.2-fake", workspaces: [
+                .fixture(workspaceID: "single", label: "Single"),
+                .fixture(workspaceID: "multi", label: "Multi"),
+                .fixture(workspaceID: "named", label: "Named"),
+            ])
+        let transport = ScriptedTransport(snapshot: snapshot)
+        let session = EventsSession(subscriptions: [], connect: { transport }, keepalive: nil)
+        let changes = AsyncStream<Void>.makeStream()
+        let projection = HostConsoleProjection(
+            host: host, session: session, snapshotRetryDelay: .seconds(1),
+            onChange: { changes.continuation.yield(()) })
+        defer {
+            projection.end()
+            changes.continuation.finish()
+        }
+        projection.start(isActive: false)
+        await projection.resume()
+        // Observe production publication, not a sleep or a polling barrier.
+        for await _ in changes.stream {
+            if !projection.isAwaitingSnapshot { break }
+        }
+
+        let row = try #require(projection.agentsByPane["single:p"])
+        #expect(row.tabLabel == "1" && row.tabPosition == 1 && row.workspaceTabCount == 1)
+        #expect(!row.showsTabLabel) // Stable tab number 42 is not its display position.
+        #expect(row.snapshotOrder == 0 && row.agent.stateChangeSeq == 7)
+        #expect(row.agent.tokens == ["pin_icon": "📌"])
+        #expect(row.agent.stateLabels == ["working": "Busy"])
+        #expect(row.agent.terminalTitle == "◑ Task" && row.agent.terminalTitleStripped == "Task")
+        #expect(row.agent.paneTitle == "Pane title" && row.agent.title == "Task")
+        let multi = try #require(projection.agentsByPane["multi:p"])
+        #expect(multi.workspaceTabCount == 2 && multi.showsTabLabel) // Count the shell-only tab too.
+        #expect(multi.snapshotOrder == 1)
+        let paneLayout = AgentRowLayout(rows: [[.init(.pane)]])
+        #expect(AgentRowRenderer.render(layout: paneLayout, agent: multi).first?.first?.text == "Manual label")
+        #expect(AgentRowRenderer.render(layout: paneLayout, agent: row).first?.first?.text == "Pane title")
+        #expect(projection.agentsByPane["named:p"]?.showsTabLabel == true)
+        #expect(projection.agentsByPane["missing:p"]?.tabLabel == nil)
+        #expect(projection.agentsByPane["missing:p"]?.showsTabLabel == false)
+    }
+
+    @Test func togglePinResortsThePublishedListImmediately() async throws {
+        let (defaults, cleanup) = try makePinDefaults()
+        defer { cleanup() }
+        let pins = PinnedAgentsStore(defaults: defaults)
+        let hostA = Host.fixture(name: "alpha", address: "a.example")
+        let hostB = Host.fixture(name: "beta", address: "b.example")
+        let transports = [
+            hostA.id: ScriptedTransport(
+                snapshot: .fixture(
+                    agents: [
+                        .fixture(paneID: "w1:p1", status: .idle),
+                        .fixture(paneID: "w1:p2", status: .working),
+                    ],
+                    workspaces: [.fixture(workspaceID: "w1", label: "Proj")])),
+            hostB.id: ScriptedTransport(
+                snapshot: .fixture(
+                    agents: [
+                        .fixture(paneID: "w2:p1", status: .blocked, workspaceID: "w2"),
+                        .fixture(paneID: "w2:p2", status: .done, workspaceID: "w2"),
+                    ],
+                    workspaces: [.fixture(workspaceID: "w2", label: "Api")])),
+        ]
+        let store = makeStore(transports: transports, pins: pins)
+
+        store.setHosts([hostA, hostB])
+        await store.resume()
+        try await waitUntil("all four agents should arrive") { store.agents.count == 4 }
+        #expect(store.agents.map(\.agent.paneID) == ["w2:p1", "w2:p2", "w1:p2", "w1:p1"])
+
+        // Pin the idle agent first, then the working one: working is rank 0.
+        store.togglePin(hostID: hostA.id, paneID: "w1:p1")
+        #expect(store.agents.map(\.agent.paneID) == ["w1:p1", "w2:p1", "w2:p2", "w1:p2"])
+
+        store.togglePin(hostID: hostA.id, paneID: "w1:p2")
+        #expect(store.agents.map(\.agent.paneID) == ["w1:p2", "w1:p1", "w2:p1", "w2:p2"])
+
+        store.togglePin(hostID: hostA.id, paneID: "w1:p2")
+        #expect(store.agents.map(\.agent.paneID) == ["w1:p1", "w2:p1", "w2:p2", "w1:p2"])
+
+        store.setHosts([])
+    }
+
+    @Test func unrecognizedStatusSortsIntoTheBottomBucket() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: AgentStatus(rawValue: "haunted")),
+                .fixture(paneID: "w1:p2", status: .working),
+                .fixture(paneID: "w1:p3", status: .unknown),
+            ]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("agents should arrive") { store.agents.count == 3 }
+
+        #expect(store.agents.first?.agent.paneID == "w1:p2")
+        #expect(
+            store.agents.dropFirst().map(\.agent.status)
+                == [AgentStatus(rawValue: "haunted"), .unknown])
+
+        store.setHosts([])
+    }
+
+    @Test func blockedStatusChangeSurfacesToTheTopWithinOneSecond() async throws {
+        // The #8 acceptance criterion: two Hosts connected, a Blocked agent
+        // reaches the top of the list within 1s of its status event.
+        let hostA = Host.fixture(name: "alpha", address: "a.example")
+        let hostB = Host.fixture(name: "beta", address: "b.example")
+        let transports = [
+            hostA.id: ScriptedTransport(
+                snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .working)])),
+            hostB.id: ScriptedTransport(
+                snapshot: .fixture(agents: [.fixture(paneID: "w2:p1", status: .idle)])),
+        ]
+        let store = makeStore(transports: transports)
+
+        store.setHosts([hostA, hostB])
+        await store.resume()
+        try await waitUntil("both agents should arrive") { store.agents.count == 2 }
+        // Wait out the pane-subscription resubscribe so the emit hits the
+        // live stream that actually carries the pane subscription.
+        try await waitUntil("pane subscription should be live") {
+            await transports[hostB.id]?.capturedSubscriptions.last?
+                .contains(.pane(.agentStatusChanged, paneID: "w2:p1")) == true
+        }
+
+        await transports[hostB.id]?.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w2:p1", status: .blocked)]))
+        let start = ContinuousClock.now
+        let emitted = await transports[hostB.id]?.emit(
+            .agentStatusChanged(paneID: "w2:p1", status: .blocked))
+        #expect(emitted == true)
+        try await waitUntil("the Blocked agent should surface to the top") {
+            store.agents.first?.agent.paneID == "w2:p1"
+                && store.agents.first?.agent.status == .blocked
+        }
+        let elapsed = ContinuousClock.now - start
+        #expect(elapsed < .seconds(1), "took \(elapsed)")
+
+        store.setHosts([])
+    }
+
+    @Test func statusChangeDuringSnapshotSurvivesTheStaleResponse() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the pane subscription should settle") {
+            let paneReads = await transport.paneReadParams
+            let subscriptions = await transport.capturedSubscriptions
+            return paneReads.count >= 2
+                && subscriptions.last?.contains(
+                    .pane(.agentStatusChanged, paneID: "w1:p1")) == true
+        }
+
+        let snapshotGate = ScriptedTransportCallGate()
+        await transport.gateNextSnapshot(using: snapshotGate)
+        let readsBeforeRace = await transport.paneReadParams.count
+        #expect(
+            await transport.emit(
+                HerdrEvent(kind: GlobalEventKind.paneAgentDetected.kind, data: .object([:])))
+                == true)
+        try await waitUntil("the stale snapshot should be in flight") {
+            await snapshotGate.entryCount == 1
+        }
+
+        // The held response stays idle; the follow-up authoritative read
+        // must represent the Host after it emitted the Blocked event.
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1", status: .blocked)]))
+        #expect(
+            await transport.emit(.agentStatusChanged(paneID: "w1:p1", status: .blocked))
+                == true)
+        try await waitUntil("the live status event should land first") {
+            store.agents.first?.agent.status == .blocked
+        }
+
+        await snapshotGate.open()
+        try await waitUntil("the stale snapshot response should finish applying") {
+            await transport.paneReadParams.count > readsBeforeRace
+        }
+        #expect(store.agents.first?.agent.status == .blocked)
+
+        store.setHosts([])
+    }
+
+    @Test func disconnectDuringInitialSnapshotConvergesFromAFreshSnapshot() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let snapshotGate = ScriptedTransportCallGate()
+        await transport.gateNextSnapshot(using: snapshotGate)
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial stale snapshot should be in flight") {
+            await snapshotGate.entryCount == 1
+        }
+        #expect(store.agents.isEmpty)
+
+        #expect(
+            await transport.emit(.agentStatusChanged(paneID: "w1:p1", status: .blocked))
+                == true)
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1", status: .blocked)]))
+        await transport.failEventStream(.channelFailed(detail: "test ordering barrier"))
+        try await waitUntil("the Host should disconnect before the stale snapshot returns") {
+            guard case .reconnecting = store.hostStatuses[host.id] else { return false }
+            return true
+        }
+        #expect(store.agents.isEmpty)
+
+        await snapshotGate.open()
+        try await waitUntil("the reconnect should apply a fresh snapshot") {
+            store.hostStatuses[host.id] == .connected
+                && store.agents.first?.agent.status == .blocked
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func initialAndReconnectSnapshotsFollowSubscriptionAcknowledgement() async throws {
+        let host = Host.fixture()
+        // Empty membership avoids a pane-subscription replacement obscuring
+        // the initial and reconnect boundaries under test.
+        let transport = ScriptedTransport(snapshot: .fixture(agents: []))
+        let store = makeStore(transports: [host.id: transport])
+        defer { store.setHosts([]) }
+
+        let initialGate = ScriptedTransportCallGate()
+        await transport.gateNextSubscription(using: initialGate)
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the first subscription should await acknowledgement") {
+            await initialGate.entryCount == 1
+        }
+        #expect(await transport.snapshotFetchCount == 0)
+        await initialGate.open()
+        try await waitUntil("the first acknowledged stream should bootstrap the Console") {
+            await transport.snapshotFetchCount == 1
+        }
+
+        let reconnectGate = ScriptedTransportCallGate()
+        await transport.gateNextSubscription(using: reconnectGate)
+        await transport.failEventStream(.channelFailed(detail: "scripted reconnect"))
+        try await waitUntil("the replacement subscription should await acknowledgement") {
+            await reconnectGate.entryCount == 1
+        }
+        #expect(await transport.snapshotFetchCount == 1)
+        await reconnectGate.open()
+        try await waitUntil("the replacement stream should trigger a fresh snapshot") {
+            await transport.snapshotFetchCount == 2
+        }
+        #expect(await transport.snapshotHadLiveSubscription == [true, true])
+    }
+
+    @Test func lifecycleEventDuringInitialSnapshotSchedulesAuthoritativeFollowup() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture(agents: []))
+        let snapshotGate = ScriptedTransportCallGate()
+        await transport.gateNextSnapshot(using: snapshotGate)
+        let store = makeStore(transports: [host.id: transport])
+        defer { store.setHosts([]) }
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the empty initial response should be held in flight") {
+            await snapshotGate.entryCount == 1
+        }
+
+        await transport.setSnapshot(.fixture(agents: [.fixture(paneID: "w1:p-new")]))
+        #expect(await transport.emit(HerdrEvent(
+            kind: GlobalEventKind.paneAgentDetected.kind,
+            data: .object(["pane_id": .string("w1:p-new")]))) == true)
+        await snapshotGate.open()
+        try await waitUntil("the live-only event should converge past the stale empty snapshot") {
+            store.agents.map(\.agent.paneID) == ["w1:p-new"]
+        }
+        #expect(await transport.snapshotFetchCount >= 2)
+    }
+
+    @Test func snapshotPushesPaneSubscriptionsIntoTheSession() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1"), .fixture(paneID: "w1:p2"),
+            ]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("resubscribe with pane ids should happen") {
+            await transport.capturedSubscriptions.last?.contains(
+                .pane(.agentStatusChanged, paneID: "w1:p1")) == true
+        }
+
+        let sets = await transport.capturedSubscriptions
+        // First subscribe knows no panes; the post-snapshot one carries both.
+        #expect(sets.first?.contains(.pane(.agentStatusChanged, paneID: "w1:p1")) == false)
+        #expect(sets.last?.contains(.pane(.agentStatusChanged, paneID: "w1:p2")) == true)
+        #expect(sets.last?.contains(.global(.paneAgentDetected)) == true)
+
+        store.setHosts([])
+    }
+
+    @Test func droppedStreamResyncsFromAFreshSnapshot() async throws {
+        // Snapshot-then-delta resync: state changed while the stream was
+        // down must arrive via the re-snapshot, not be waited for as events.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("initial agent should arrive") { store.agents.count == 1 }
+
+        await transport.setSnapshot(
+            .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .blocked),
+                .fixture(paneID: "w1:p9", status: .working),
+            ]))
+        await transport.failEventStream(.channelFailed(detail: "stream died"))
+
+        try await waitUntil("the resync should deliver the new snapshot") {
+            store.agents.map(\.agent.paneID) == ["w1:p1", "w1:p9"]
+        }
+        #expect(store.agents.first?.agent.status == .blocked)
+
+        store.setHosts([])
+    }
+
+    @Test(.timeLimit(.minutes(1)))
+    func disconnectedHostRemovesItsStaleAgentsImmediately() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .working)]))
+        let store = makeStore(
+            transports: [host.id: transport],
+            reconnectPolicy: ReconnectPolicy(
+                initialDelay: .seconds(30), multiplier: 1, maxDelay: .seconds(30)))
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial agent should arrive") { store.agents.count == 1 }
+
+        // Publishing the snapshot precedes installing its pane subscription.
+        // Inject the failure only after that replacement stream is live.
+        try await transport.waitForLiveSubscription(containing: [
+            .pane(.agentStatusChanged, paneID: "w1:p1")
+        ])
+        await transport.failEventStream(.channelFailed(detail: "Host went offline"))
+        try await waitUntil("the Host should report its disconnected state") {
+            guard case .reconnecting = store.hostStatuses[host.id] else { return false }
+            return true
+        }
+
+        #expect(store.agents.isEmpty)
+
+        store.setHosts([])
+    }
+
+    @Test func staleSnapshotCannotRestoreAgentsAfterTheHostDisconnects() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .working)]))
+        let store = makeStore(
+            transports: [host.id: transport],
+            reconnectPolicy: ReconnectPolicy(
+                initialDelay: .seconds(30), multiplier: 1, maxDelay: .seconds(30)))
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial snapshot cycle should settle") {
+            await transport.snapshotFetchCount >= 2
+        }
+
+        let snapshotGate = ScriptedTransportCallGate()
+        await transport.gateNextSnapshot(using: snapshotGate)
+        #expect(
+            await transport.emit(
+                HerdrEvent(
+                    kind: GlobalEventKind.workspaceMetadataUpdated.kind,
+                    data: .object([:]))) == true)
+        try await waitUntil("the stale snapshot should be in flight") {
+            await snapshotGate.entryCount == 1
+        }
+
+        await transport.failEventStream(.channelFailed(detail: "Host went offline"))
+        try await waitUntil("the Host should report its disconnected state") {
+            guard case .reconnecting = store.hostStatuses[host.id] else { return false }
+            return true
+        }
+        await snapshotGate.open()
+        try await Task.sleep(for: .milliseconds(50))
+
+        #expect(store.agents.isEmpty)
+
+        store.setHosts([])
+    }
+
+    @Test func unknownAgentStatusResnapshotsAndRemovesAReleasedAgent() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .working)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the pane subscription should settle") {
+            await transport.capturedSubscriptions.last?.contains(
+                .pane(.agentStatusChanged, paneID: "w1:p1")) == true
+        }
+
+        await transport.setSnapshot(.fixture())
+        #expect(
+            await transport.emit(.agentStatusChanged(paneID: "w1:p1", status: .unknown))
+                == true)
+
+        try await waitUntil(
+            "the exited Agent should disappear through a fresh snapshot",
+            timeout: .seconds(1)
+        ) {
+            store.agents.isEmpty
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func forcedEventOverflowConvergesViaTheDropMarkerResync() async throws {
+        // The #22 acceptance criterion: force the bounded events buffer to
+        // overflow and prove the Console converges anyway. The server state
+        // changes with no membership event — only ignorable noise — so the
+        // drop marker's resync is the one path to the new snapshot.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let box = SessionBox()
+        let store = ConsoleStore { _, subscriptions in
+            let session = EventsSession(
+                subscriptions: subscriptions,
+                connect: { transport },
+                reconnectPolicy: Self.fastPolicy,
+                keepalive: nil,
+                updatesBufferLimit: 2)
+            Task { await box.set(session) }
+            return session
+        }
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial agent should arrive") { store.agents.count == 1 }
+        // Let the connect→snapshot→resubscribe→re-snapshot cycle settle, so
+        // no in-flight resync can fetch the updated snapshot by accident.
+        try await waitUntil("the pane subscription should be live") {
+            await transport.capturedSubscriptions.last?
+                .contains(.pane(.agentStatusChanged, paneID: "w1:p1")) == true
+        }
+        try await waitUntil("the post-resubscribe resync should settle") {
+            await transport.snapshotFetchCount >= 2
+        }
+        let session = try #require(await box.session)
+
+        await transport.setSnapshot(
+            .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w1:p9", status: .blocked),
+            ]))
+        // Flood with events the Console ignores until the bounded buffer
+        // demonstrably sheds updates.
+        try await waitUntil("the bounded buffer should shed updates") {
+            for _ in 0..<50 {
+                await transport.emit(
+                    HerdrEvent(kind: PaneEventKind.scrollChanged.kind, data: .object([:])))
+            }
+            return await session.droppedUpdateCount > 0
+        }
+
+        try await waitUntil("the marker resync should surface the pane changed during the gap") {
+            store.agents.map(\.agent.paneID) == ["w1:p9", "w1:p1"]
+        }
+        #expect(store.agents.first?.agent.status == .blocked)
+
+        store.setHosts([])
+    }
+
+    @Test func membershipEventTriggersAResnapshot() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("initial agent should arrive") { store.agents.count == 1 }
+
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1"), .fixture(paneID: "w1:p2")]))
+        await transport.emit(
+            HerdrEvent(
+                kind: GlobalEventKind.paneAgentDetected.kind,
+                data: .object(["pane_id": .string("w1:p2")])))
+
+        try await waitUntil("the detected agent should appear via re-snapshot") {
+            store.agents.count == 2
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func workspaceCreationRefreshesTheNewAgentPicker() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(workspaces: [.fixture(workspaceID: "w1", label: "Proj")]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial workspace should arrive") {
+            store.workspaces(for: host.id).map(\.id) == ["w1"]
+        }
+        try await waitUntil("workspace creation should be subscribed") {
+            await transport.capturedSubscriptions.last?.contains(.global(.workspaceCreated)) == true
+        }
+        let pickerRefreshObserved = Mutex(false)
+        withObservationTracking {
+            _ = store.workspaces(for: host.id)
+        } onChange: {
+            pickerRefreshObserved.withLock { $0 = true }
+        }
+
+        await transport.setSnapshot(
+            .fixture(workspaces: [
+                .fixture(workspaceID: "w1", label: "Proj"),
+                .fixture(workspaceID: "w2", label: "Api"),
+            ]))
+        await transport.emit(
+            HerdrEvent(kind: GlobalEventKind.workspaceCreated.kind, data: .object([:])))
+
+        try await waitUntil("the new workspace should appear without reconnecting") {
+            store.workspaces(for: host.id).map(\.id) == ["w2", "w1"]
+        }
+        #expect(pickerRefreshObserved.withLock { $0 })
+
+        store.setHosts([])
+    }
+
+    @Test func snapshotFailureSurfacesAndRetriesUntilRecovery() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")]))
+        await transport.setSnapshotFailure(.timedOut)
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the sync failure should be visible") {
+            store.hostSyncErrors[host.id] != nil
+        }
+
+        await transport.setSnapshotFailure(nil)
+        try await waitUntil("the retry should recover the snapshot") {
+            store.agents.map(\.agent.paneID) == ["w1:p1"]
+                && store.hostSyncErrors[host.id] == nil
+        }
+        #expect(await transport.snapshotFetchCount >= 2)
+
+        store.setHosts([])
+    }
+
+    @Test func cardsCarryTheLastOutputSnippet() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .blocked)]))
+        await transport.setPaneText(
+            "\n› Allow Claude to run rm -rf?\n\n  1. Yes  2. No\n", paneID: "w1:p1")
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the snippet should land on the card") {
+            store.agents.first?.lastOutputSnippet == "1. Yes  2. No"
+        }
+        let params = try #require(await transport.paneReadParams.first)
+        #expect(params.source == .recent)
+        #expect(params.stripANSI == true)
+
+        store.setHosts([])
+    }
+
+    @Test func blockedStatusDuringSnippetFetchSchedulesAFollowUpRead() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .working)]))
+        await transport.setPaneText("Ready", paneID: "w1:p1")
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial snapshot cycle should settle") {
+            let reads = await transport.paneReadParams
+            let subscriptions = await transport.capturedSubscriptions
+            return reads.count >= 2
+                && subscriptions.last?.contains(
+                    .pane(.agentStatusChanged, paneID: "w1:p1")) == true
+                && store.agents.first?.lastOutputSnippet == "Ready"
+        }
+
+        let staleReadGate = ScriptedTransportCallGate()
+        await transport.setPaneText("Still working", paneID: "w1:p1")
+        await transport.gateNextPaneRead(using: staleReadGate)
+        #expect(
+            await transport.emit(.agentStatusChanged(paneID: "w1:p1", status: .working))
+                == true)
+        try await waitUntil("the stale snippet read should be in flight") {
+            await staleReadGate.entryCount == 1
+        }
+
+        let followUpReadGate = ScriptedTransportCallGate()
+        await transport.setPaneText("Allow this command?", paneID: "w1:p1")
+        await transport.gateNextPaneRead(using: followUpReadGate)
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1", status: .blocked)]))
+        #expect(
+            await transport.emit(.agentStatusChanged(paneID: "w1:p1", status: .blocked))
+                == true)
+        try await waitUntil("the Blocked status should land during the stale read") {
+            store.agents.first?.agent.status == .blocked
+        }
+        for _ in 0..<10 { await Task.yield() }
+
+        await staleReadGate.open()
+        try await waitUntil("the Blocked refresh should start a follow-up read") {
+            await followUpReadGate.entryCount == 1
+        }
+        await followUpReadGate.open()
+        try await waitUntil("the Blocked prompt should replace the stale snippet") {
+            store.agents.first?.lastOutputSnippet == "Allow this command?"
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func removingAHostDropsItsAgentsAndEndsItsSession() async throws {
+        let hostA = Host.fixture(name: "alpha", address: "a.example")
+        let hostB = Host.fixture(name: "beta", address: "b.example")
+        let transports = [
+            hostA.id: ScriptedTransport(
+                snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")])),
+            hostB.id: ScriptedTransport(
+                snapshot: .fixture(agents: [.fixture(paneID: "w2:p1")])),
+        ]
+        let store = makeStore(transports: transports)
+
+        store.setHosts([hostA, hostB])
+        await store.resume()
+        try await waitUntil("both agents should arrive") { store.agents.count == 2 }
+        #expect(store.hostConnectionGenerations[hostB.id] == 0)
+
+        store.setHosts([hostA])
+
+        #expect(store.agents.map(\.agent.paneID) == ["w1:p1"])
+        #expect(store.hostStatuses[hostB.id] == nil)
+        #expect(store.hostConnectionGenerations[hostB.id] == nil)
+        try await waitUntil("the removed Host's transport should close") {
+            await transports[hostB.id]?.isClosed == true
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func terminalRunnerOpensTheHostsLiveTransport() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+
+        let runner = store.terminalRunner(for: host.id)
+        let request = TerminalAttachRequest(target: "w1:p1", cols: 80, rows: 24)
+        try await runner(request, TerminalSessionHandler { _ in })
+        #expect(await transport.attachRequests == [request])
+
+        let missing = store.terminalRunner(for: UUID())
+        await #expect(throws: TransportError.self) {
+            try await missing(request, TerminalSessionHandler { _ in })
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func terminalRunnerWaitsForPreviousTerminalTeardown() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(transports: [host.id: transport])
+        let gate = TerminalTeardownGate()
+        let result = TerminalOperationResult()
+        let request = TerminalAttachRequest(target: "w1:p1", cols: 80, rows: 24)
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+
+        let runner = store.terminalRunner(for: host.id)
+        let first = Task {
+            try await runner(
+                request,
+                TerminalSessionHandler { _ in
+                    await gate.waitUntilOpen()
+                })
+        }
+        try await waitUntil("the first terminal should open") {
+            await transport.attachRequests.count == 1
+        }
+        let second = Task {
+            try await runner(
+                request,
+                TerminalSessionHandler { _ in
+                    await result.set()
+                })
+        }
+
+        try await waitUntil("the previous teardown should start") {
+            await gate.enteredCount == 1
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        #expect(await !result.wasSet)
+        #expect(await transport.attachRequests.count == 1)
+
+        await gate.open()
+        try await first.value
+        try await second.value
+        #expect(await result.wasSet)
+        #expect(await transport.attachRequests.count == 2)
+
+        store.setHosts([])
+    }
+
+    @Test func cancellingQueuedTerminalDoesNotLeakExclusiveAccess() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(transports: [host.id: transport])
+        let gate = TerminalTeardownGate()
+        let request = TerminalAttachRequest(target: "w1:p1", cols: 80, rows: 24)
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+
+        let runner = store.terminalRunner(for: host.id)
+        let first = Task {
+            try await runner(
+                request,
+                TerminalSessionHandler { _ in
+                    await gate.waitUntilOpen()
+                })
+        }
+        try await waitUntil("the first terminal should open") {
+            await transport.attachRequests.count == 1
+        }
+
+        let cancelled = Task {
+            try await runner(request, TerminalSessionHandler { _ in })
+        }
+        try await Task.sleep(for: .milliseconds(30))
+        cancelled.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await cancelled.value
+        }
+
+        await gate.open()
+        try await first.value
+        try await runner(request, TerminalSessionHandler { _ in })
+        #expect(await transport.attachRequests.count == 2)
+
+        store.setHosts([])
+    }
+
+    @Test func workspacesExposeTheHostsSnapshotWorkspaces() async throws {
+        // The new-agent picker (#12) offers the workspaces the store already
+        // knows for a Host, including ones with no agents in them yet.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(
+                agents: [.fixture(paneID: "w1:p1", workspaceID: "w1")],
+                workspaces: [
+                    .fixture(workspaceID: "w2", label: "Api"),
+                    .fixture(workspaceID: "w1", label: "Proj"),
+                ]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the snapshot's workspaces should land") {
+            store.workspaces(for: host.id).count == 2
+        }
+
+        // Sorted by label; a Host the store never saw offers none.
+        #expect(store.workspaces(for: host.id).map(\.label) == ["Api", "Proj"])
+        #expect(store.workspaces(for: host.id).map(\.id) == ["w2", "w1"])
+        #expect(store.workspaces(for: UUID()).isEmpty)
+
+        store.setHosts([])
+    }
+
+    @Test func availableAgentKindsUseTheSelectedHostsLiveTransport() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport()
+        await transport.setAvailableAgentKinds([.codex, .opencode])
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+
+        let kinds = try await store.availableAgentKinds(on: host.id)
+        #expect(kinds == [.codex, .opencode])
+        #expect(await transport.agentDiscoveryCount == 1)
+
+        store.setHosts([])
+    }
+
+    @Test func availableAgentKindsRejectAnUnknownHost() async {
+        let store = makeStore(transports: [:])
+
+        await #expect(throws: TransportError.self) {
+            _ = try await store.availableAgentKinds(on: UUID())
+        }
+    }
+
+    @Test func startAgentForwardsItsParamsAndResnapshots() async throws {
+        // Agent launch (#12): the request reaches the Host's transport, and the
+        // started pane surfaces via one explicit resync rather than waiting
+        // on the membership event.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial agent should arrive") { store.agents.count == 1 }
+        let snapshotsBefore = await transport.snapshotFetchCount
+
+        // The started pane joins the next snapshot the server would report.
+        await transport.setSnapshot(
+            .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w1:pnew", status: .working),
+            ]))
+        let started = try await store.startAgent(
+            AgentLaunchRequest(kind: "claude", name: "claude", workspaceID: "w1"), on: host.id)
+
+        #expect(started.status == .working)
+        let starts = await transport.agentStarts
+        #expect(starts.map(\.kind) == ["claude"])
+        #expect(starts.map(\.arguments) == [[]])
+        #expect(starts.first?.workspaceID == "w1")
+        try await waitUntil("the resync should surface the new pane") {
+            store.agents.map(\.agent.paneID) == ["w1:pnew", "w1:p1"]
+        }
+        #expect(await transport.snapshotFetchCount > snapshotsBefore)
+
+        store.setHosts([])
+    }
+
+    @Test func startAgentInNewWorktreeForwardsTheSpecAndResnapshots() async throws {
+        // The fresh-worktree launch (#97) rides the same machinery: the
+        // request/spec pair reaches the Host's transport, and the started
+        // pane surfaces via one explicit resync.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture(agents: []))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+        let snapshotsBefore = await transport.snapshotFetchCount
+
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "wt1:pnew", status: .working, workspaceID: "wt1")]))
+        let started = try await store.startAgentInNewWorktree(
+            AgentLaunchRequest(kind: "claude", name: "reviewer", workspaceID: "w1"),
+            worktree: WorktreeSpec(branch: "task/fix-97", base: "origin/main"),
+            on: host.id)
+
+        #expect(started.workspaceID == "wt1")
+        let starts = await transport.worktreeStarts
+        #expect(starts.map { $0.request.workspaceID } == ["w1"])
+        #expect(
+            starts.map { $0.worktree }
+                == [WorktreeSpec(branch: "task/fix-97", base: "origin/main")])
+        try await waitUntil("the resync should surface the new pane") {
+            store.agents.map(\.agent.paneID) == ["wt1:pnew"]
+        }
+        #expect(await transport.snapshotFetchCount > snapshotsBefore)
+
+        store.setHosts([])
+    }
+
+    @Test func startAgentInNewWorkspaceForwardsTheSpecAndResnapshots() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture(agents: []))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+        let snapshotsBefore = await transport.snapshotFetchCount
+
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "nw1:pnew", status: .working, workspaceID: "nw1")]))
+        let started = try await store.startAgentInNewWorkspace(
+            AgentLaunchRequest(kind: "claude", name: "reviewer"),
+            workspace: NewWorkspaceSpec(directory: "/src/app", label: "App"),
+            on: host.id)
+
+        #expect(started.workspaceID == "nw1")
+        let starts = await transport.workspaceStarts
+        #expect(starts.map { $0.request.kind } == ["claude"])
+        #expect(starts.map { $0.request.workspaceID } == [nil])
+        #expect(
+            starts.map { $0.workspace }
+                == [NewWorkspaceSpec(directory: "/src/app", label: "App")])
+        try await waitUntil("the resync should surface the new pane") {
+            store.agents.map(\.agent.paneID) == ["nw1:pnew"]
+        }
+        #expect(await transport.snapshotFetchCount > snapshotsBefore)
+
+        store.setHosts([])
+    }
+
+    @Test func waitForAgentReturnsOnceTheResyncSurfacesThePane() async throws {
+        // The new-agent flow opens the started pane's terminal; the wait
+        // bridges the gap between the start RPC and the resync that makes
+        // the Console row exist.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture(agents: []))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:pnew", status: .working)]))
+        _ = try await store.startAgent(
+            AgentLaunchRequest(kind: "claude", name: "claude", workspaceID: "w1"), on: host.id)
+        await store.waitForAgent(ConsoleAgent.ID(hostID: host.id, paneID: "w1:pnew"))
+
+        #expect(store.agents.map(\.agent.paneID) == ["w1:pnew"])
+
+        store.setHosts([])
+    }
+
+    @Test func waitForAgentGivesUpAfterItsTimeout() async {
+        let store = makeStore(transports: [:])
+        let ghost = ConsoleAgent.ID(hostID: Host.fixture().id, paneID: "w1:ghost")
+
+        // Never reported; the wait must return on its own rather than hang.
+        await store.waitForAgent(ghost, timeout: .milliseconds(120))
+
+        #expect(store.agents.isEmpty)
+    }
+
+    /// The fresh-session send bug: a launch's new pane forces the next resync
+    /// to reinstall the pane subscription set, and a degraded link turns that
+    /// reinstall into a silent transport replacement (no `.reconnecting`, the
+    /// Host still reads `.connected`). The composer's first send used to die
+    /// with `sshUnreachable` inside that window; it now waits out the redial
+    /// and delivers on the replacement Transport.
+    @Test func promptAgentSurvivesTheSilentTransportReplacement() async throws {
+        let host = Host.fixture()
+        let first = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let replacement = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w1:pnew", status: .idle),
+            ]))
+        let queue = ConnectionAttemptQueue([.success(first), .success(replacement)])
+        let connectGate = ScriptedTransportCallGate()
+        let store = ConsoleStore(
+            snapshotRetryDelay: .milliseconds(10),
+            pins: PinnedAgentsStore(
+                defaults: UserDefaults(suiteName: "hm-console-pins-\(UUID().uuidString)")
+                    ?? .standard)
+        ) { host, subscriptions in
+            EventsSession(
+                subscriptions: subscriptions,
+                connect: {
+                    let transport = try await queue.next()
+                    let dial = await queue.attemptCount
+                    if dial > 1 {
+                        await connectGate.waitUntilOpen()
+                    }
+                    return transport
+                },
+                reconnectPolicy: Self.fastPolicy,
+                keepalive: nil)
+        }
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial Agent should arrive") {
+            store.agents.map(\.agent.paneID) == ["w1:p1"]
+        }
+
+        // The launched pane's membership change forces the reinstall, and
+        // the degraded link makes it a silent redial held closed by the gate.
+        await first.setSnapshot(
+            .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w1:pnew", status: .idle),
+            ]))
+        await first.setConnectionAlive(false)
+        #expect(
+            await first.emit(
+                HerdrEvent(kind: GlobalEventKind.paneAgentDetected.kind, data: .object([:])))
+            == true)
+        try await waitUntil("the reinstall should hold the replacement dial closed") {
+            await connectGate.entryCount == 1
+        }
+
+        let prompt = Task {
+            try await store.promptAgent(
+                AgentPromptParams(target: "w1:pnew", text: "hello"), on: host.id)
+        }
+        // The redial is still closed; the old fail-fast behavior would
+        // already have surfaced `sshUnreachable` here.
+        try await Task.sleep(for: .milliseconds(50))
+        await connectGate.open()
+        let prompted = try await prompt.value
+
+        #expect(prompted.paneID == "w1:pnew")
+        try await waitUntil("the send should have landed on the replacement") {
+            let params = await replacement.agentPromptParams
+            return params.map(\.target) == ["w1:pnew"] && params.map(\.text) == ["hello"]
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func startAgentThrowsWhenTheHostIsUnknown() async throws {
+        let host = Host.fixture()
+        let store = makeStore(transports: [:])
+
+        // No feed for this Host at all: nothing to start against.
+        await #expect(throws: TransportError.self) {
+            try await store.startAgent(
+                AgentLaunchRequest(kind: "claude", name: "claude"), on: host.id)
+        }
+    }
+
+    @Test func closePaneForwardsItsTargetAndResnapshots() async throws {
+        // pane.close (#13, User Story 9): the target reaches the Host's
+        // transport, and the removed pane disappears via one explicit resync
+        // rather than waiting on the pane.closed membership event.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w1:p2", status: .idle),
+            ]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("both agents should arrive") { store.agents.count == 2 }
+        let snapshotsBefore = await transport.snapshotFetchCount
+
+        // The closed pane is gone from the next snapshot the server reports.
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        try await store.closePane("w1:p2", on: host.id)
+
+        let closed = await transport.closedPanes
+        #expect(closed.map(\.paneID) == ["w1:p2"])
+        try await waitUntil("the resync should drop the closed pane") {
+            store.agents.map(\.agent.paneID) == ["w1:p1"]
+        }
+        #expect(await transport.snapshotFetchCount > snapshotsBefore)
+
+        store.setHosts([])
+    }
+
+    @Test func closePaneThrowsWhenTheHostIsUnknown() async throws {
+        let host = Host.fixture()
+        let store = makeStore(transports: [:])
+
+        // No feed for this Host at all: nothing to close against.
+        await #expect(throws: TransportError.self) {
+            try await store.closePane("w1:p1", on: host.id)
+        }
+    }
+
+    @Test func closePaneFailureLeavesTheAgentsUntouched() async throws {
+        // The cancel/failure path must never mutate the list: a rejected
+        // close propagates and leaves every agent in place.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the agent should arrive") { store.agents.count == 1 }
+
+        await transport.setCloseFailure(.timedOut)
+        await #expect(throws: TransportError.timedOut) {
+            try await store.closePane("w1:p1", on: host.id)
+        }
+        #expect(store.agents.map(\.agent.paneID) == ["w1:p1"])
+        #expect(await transport.closedPanes.isEmpty)
+
+        store.setHosts([])
+    }
+
+    @Test func closeAgentInASharedTabClosesOnlyItsPaneAndPin() async throws {
+        // The swipe action on an Agent whose tab holds other panes: only its
+        // pane.close reaches the transport, and only its pin is dropped —
+        // the neighbours in the tab live on.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w1:p2", status: .idle),
+                .fixture(paneID: "w2:p1", status: .idle, workspaceID: "w2"),
+            ]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("all agents should arrive") { store.agents.count == 3 }
+        store.togglePin(hostID: host.id, paneID: "w1:p1")
+        store.togglePin(hostID: host.id, paneID: "w1:p2")
+        store.togglePin(hostID: host.id, paneID: "w2:p1")
+
+        let victim = try #require(store.agents.first { $0.agent.paneID == "w1:p1" })
+        #expect(victim.tabPaneCount == 2)
+        try await store.closeAgent(victim)
+
+        #expect(await transport.closedPanes == [PaneTarget(paneID: "w1:p1")])
+        #expect(await transport.closedTabs.isEmpty)
+        #expect(!store.pins.isPinned(hostID: host.id, paneID: "w1:p1"))
+        #expect(store.pins.isPinned(hostID: host.id, paneID: "w1:p2"))
+        #expect(store.pins.isPinned(hostID: host.id, paneID: "w2:p1"))
+    }
+
+    @Test func closeAgentAloneInItsTabClosesTheTabAndDropsItsPin() async throws {
+        // tab.close (#8 swipe action): an Agent whose pane is its tab's last
+        // takes the tab with it, and its pin must not dangle onto an id
+        // herdr could reuse.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle),
+                .fixture(paneID: "w2:p1", status: .idle, workspaceID: "w2"),
+            ]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("all agents should arrive") { store.agents.count == 2 }
+        store.togglePin(hostID: host.id, paneID: "w1:p1")
+        store.togglePin(hostID: host.id, paneID: "w2:p1")
+
+        let victim = try #require(store.agents.first { $0.agent.paneID == "w1:p1" })
+        try await store.closeAgent(victim)
+
+        #expect(await transport.closedTabs == [TabTarget(tabID: "w1:t1")])
+        #expect(await transport.closedPanes.isEmpty)
+        #expect(!store.pins.isPinned(hostID: host.id, paneID: "w1:p1"))
+        #expect(store.pins.isPinned(hostID: host.id, paneID: "w2:p1"))
+    }
+
+    @Test func aShellPaneBesideTheAgentKeepsItsTabOpen() async throws {
+        // Shell panes are not Agents, so only the tab's reported pane count
+        // shows the Agent is not alone in it.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: SessionSnapshot(
+                agents: [.fixture(paneID: "w1:p1", status: .idle)], layouts: [], panes: [],
+                protocolVersion: 17,
+                tabs: [
+                    TabInfo(agentStatus: .idle, focused: false, label: "1", number: 1,
+                            paneCount: 2, tabID: "w1:t1", workspaceID: "w1"),
+                ],
+                version: "0.7.5-fake", workspaces: []))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the agent should arrive") { store.agents.count == 1 }
+
+        let agent = try #require(store.agents.first)
+        #expect(agent.tabPaneCount == 2)
+        try await store.closeAgent(agent)
+
+        #expect(await transport.closedPanes == [PaneTarget(paneID: "w1:p1")])
+        #expect(await transport.closedTabs.isEmpty)
+    }
+
+    /// The swipe action's alert must read as herdr's refusal or a transport
+    /// state, never as Foundation's opaque `localizedDescription` for a
+    /// non-`LocalizedError` enum.
+    @Test func tabCloseFailureMessageNamesTheCause() {
+        #expect(
+            ConsoleStore.tabCloseFailureMessage(
+                for: HerdrAPIError(code: "tab_not_found", message: "tab w1:t9 not found"))
+                == "herdr rejected the close: tab w1:t9 not found")
+        #expect(
+            ConsoleStore.tabCloseFailureMessage(for: TransportError.sshUnreachable(detail: ""))
+                == "The Host is not connected.")
+        #expect(
+            ConsoleStore.tabCloseFailureMessage(for: TransportError.timedOut)
+                == "The Host did not answer in time.")
+    }
+
+    @Test func closeAgentThrowsWhenTheHostIsUnknown() async throws {
+        let host = Host.fixture()
+        let store = makeStore(transports: [:])
+        let agent = consoleAgent(
+            hostID: host.id, hostName: host.name, paneID: "w1:p1", status: .idle)
+
+        await #expect(throws: TransportError.self) {
+            try await store.closeAgent(agent)
+        }
+    }
+
+    @Test func focusAgentForwardsOpaqueTargetToItsHostAndResnapshotsAllRows() async throws {
+        let host = Host.fixture()
+        let otherHost = Host.fixture(name: "Other")
+        let paneID = "opaque:Pane/A"
+        let done: [AgentInfo] = [
+            .fixture(paneID: paneID, status: .done),
+            .fixture(paneID: "sibling", status: .done),
+        ]
+        let transport = ScriptedTransport(snapshot: .fixture(agents: done))
+        let otherTransport = ScriptedTransport(snapshot: .fixture(agents: done))
+        let store = makeStore(transports: [host.id: transport, otherHost.id: otherTransport])
+        store.setHosts([host, otherHost])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("both Hosts should be ready") { store.agents.count == 4 }
+        // Drain subscription-triggered startup snapshots before counting calls.
+        await store.refreshSidebarLayouts()
+        let before = await transport.snapshotFetchCount
+        await transport.setSnapshot(.fixture(agents: [
+            .fixture(paneID: paneID, status: .idle),
+            .fixture(paneID: "sibling", status: .idle),
+        ]))
+        try await store.focusAgent(paneID, on: host.id)
+        #expect(await transport.agentFocuses == [AgentTarget(target: paneID)])
+        #expect(await otherTransport.agentFocuses.isEmpty)
+        try await waitUntil("the full Host snapshot should mark both rows Idle") {
+            store.agents.filter { $0.hostID == host.id }.map(\.agent.status) == [.idle, .idle]
+        }
+        #expect(await transport.snapshotFetchCount > before)
+        #expect(
+            store.agents.filter { $0.hostID == otherHost.id }
+                .allSatisfy { $0.agent.status == .done })
+    }
+
+    @Test func focusFailurePreservesDoneAndDoesNotRequestASuccessResnapshot() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "pane", status: .done)]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the Done Agent should arrive") { store.agents.count == 1 }
+        await store.refreshSidebarLayouts()
+        let before = await transport.snapshotFetchCount
+        await transport.setFocusFailure(.timedOut)
+        await #expect(throws: TransportError.timedOut) {
+            try await store.focusAgent("pane", on: host.id)
+        }
+        // The single retry rides the replacement, so the focus reaches the
+        // transport once per attempt.
+        #expect(await transport.agentFocuses == [
+            AgentTarget(target: "pane"), AgentTarget(target: "pane"),
+        ])
+        // The redial ends the stale events channel, and the fresh
+        // `.connected` that follows is the consumer's usual re-snapshot
+        // signal: exactly one resync beyond the pre-focus count. A FAILED
+        // focus must not add a success resync on top of it.
+        try await waitUntil("the reconnect resync should land") {
+            await transport.snapshotFetchCount == before + 1
+        }
+        // Give an incorrectly scheduled success refresh time to reach the transport.
+        try await Task.sleep(for: .milliseconds(25))
+        #expect(await transport.snapshotFetchCount == before + 1)
+        #expect(store.agents.map(\.agent.status) == [.done])
+    }
+
+    @Test func focusDoesNotSendWhenTheAgentHasAlreadyLeftDone() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture(agents: [
+            .fixture(paneID: "working", status: .working),
+            .fixture(paneID: "idle", status: .idle),
+        ]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the Agents should arrive") { store.agents.count == 2 }
+        for paneID in ["working", "idle"] {
+            await #expect(throws: CancellationError.self) {
+                try await store.focusAgent(paneID, on: host.id)
+            }
+        }
+        #expect(await transport.agentFocuses.isEmpty)
+    }
+
+    @Test func focusRejectsUnavailableHostAndMissingAgent() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(transports: [host.id: transport])
+        await #expect(throws: TransportError.self) {
+            try await store.focusAgent("missing", on: host.id)
+        }
+        store.setHosts([host])
+        defer { store.setHosts([]) }
+        await store.resume()
+        try await waitUntil("the empty inventory should be known") {
+            store.hostStatuses[host.id] == .connected
+                && !store.hostsAwaitingSnapshot.contains(host.id)
+        }
+        await #expect(throws: TransportError.apiRejected(
+            code: "agent_not_found", message: "The Agent is no longer listed.")) {
+            try await store.focusAgent("missing", on: host.id)
+        }
+        await store.suspend()
+        await #expect(throws: TransportError.self) {
+            try await store.focusAgent("missing", on: host.id)
+        }
+        #expect(await transport.agentFocuses.isEmpty)
+    }
+
+    @Test func renameAgentForwardsItsParamsAndResnapshots() async throws {
+        // agent.rename (#98): the params reach the Host's transport, and the
+        // new name lands via one explicit resync — pane.updated is not a
+        // resync trigger (it fires on every terminal-title change), so the
+        // post-RPC resync is what surfaces the rename.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the agent should arrive") { store.agents.count == 1 }
+        let snapshotsBefore = await transport.snapshotFetchCount
+
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle, name: "reviewer")]))
+        try await store.renameAgent("w1:p1", name: "reviewer", on: host.id)
+
+        let renames = await transport.agentRenames
+        #expect(renames == [AgentRenameParams(target: "w1:p1", name: "reviewer")])
+        try await waitUntil("the resync should surface the new name") {
+            store.agents.map(\.agent.displayName) == ["reviewer"]
+        }
+        #expect(await transport.snapshotFetchCount > snapshotsBefore)
+
+        store.setHosts([])
+    }
+
+    @Test func renameAgentForwardsANilNameAsTheClear() async throws {
+        // A nil name clears the custom name back to the detected kind
+        // (verified live against herdr 0.7.5); the transport must see the
+        // nil, not an empty string.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [
+                .fixture(paneID: "w1:p1", status: .idle, name: "reviewer")
+            ]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the agent should arrive") {
+            store.agents.map(\.agent.displayName) == ["reviewer"]
+        }
+
+        await transport.setSnapshot(
+            .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        try await store.renameAgent("w1:p1", name: nil, on: host.id)
+
+        let renames = await transport.agentRenames
+        #expect(renames == [AgentRenameParams(target: "w1:p1", name: nil)])
+        try await waitUntil("the resync should fall back to the detected kind") {
+            store.agents.map(\.agent.displayName) == ["claude"]
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func renameWorkspaceForwardsItsParamsAndResnapshots() async throws {
+        // workspace.rename (#98): the params reach the Host's transport and
+        // the relabeled workspace lands via one explicit resync rather than
+        // waiting on the workspace.renamed membership event.
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(workspaces: [.fixture(workspaceID: "w1", label: "Old")]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the workspace should arrive") {
+            store.workspaces(for: host.id).map(\.label) == ["Old"]
+        }
+
+        await transport.setSnapshot(
+            .fixture(workspaces: [.fixture(workspaceID: "w1", label: "New")]))
+        try await store.renameWorkspace("w1", label: "New", on: host.id)
+
+        let renames = await transport.workspaceRenames
+        #expect(renames == [WorkspaceRenameParams(label: "New", workspaceID: "w1")])
+        try await waitUntil("the resync should surface the new label") {
+            store.workspaces(for: host.id).map(\.label) == ["New"]
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func renamesThrowWhenTheHostIsUnknown() async throws {
+        let host = Host.fixture()
+        let store = makeStore(transports: [:])
+
+        await #expect(throws: TransportError.self) {
+            try await store.renameAgent("w1:p1", name: "x", on: host.id)
+        }
+        await #expect(throws: TransportError.self) {
+            try await store.renameWorkspace("w1", label: "x", on: host.id)
+        }
+    }
+
+    @Test func renameFailurePropagatesAndLeavesTheAgentsUntouched() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .idle)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the agent should arrive") { store.agents.count == 1 }
+
+        await transport.setRenameFailure(.timedOut)
+        await #expect(throws: TransportError.timedOut) {
+            try await store.renameAgent("w1:p1", name: "x", on: host.id)
+        }
+        #expect(store.agents.map(\.agent.displayName) == ["claude"])
+        #expect(await transport.agentRenames.isEmpty)
+
+        store.setHosts([])
+    }
+
+    @Test func hostStatusesExposeStalenessPerHost() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should report connected") {
+            store.hostStatuses[host.id] == .connected
+        }
+        try await waitUntil("the Host should publish its ping latency") {
+            store.hostLatencies[host.id] != nil
+        }
+
+        await store.suspend()
+        try await waitUntil("the Host should report suspended") {
+            store.hostStatuses[host.id] == .suspended
+        }
+
+        store.setHosts([])
+        #expect(store.hostLatencies.isEmpty)
+    }
+
+    /// The route a Host reached (ADR 0022) is published with `.connected`
+    /// and dropped with the connection, like its latency.
+    @Test func hostRouteIDFollowsTheConnectionThatReachedIt() async throws {
+        let host = Host.fixture()
+        let routeID = try #require(host.routes.first?.id)
+        let transport = ScriptedTransport(snapshot: .fixture(), routeID: routeID)
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should report connected") {
+            store.hostStatuses[host.id] == .connected
+        }
+        #expect(store.hostRouteIDs[host.id] == routeID)
+
+        await store.suspend()
+        try await waitUntil("the Host should report suspended") {
+            store.hostStatuses[host.id] == .suspended
+        }
+        #expect(store.hostRouteIDs[host.id] == nil)
+
+        store.setHosts([])
+    }
+
+    /// A latency belongs to the connection that measured it (#236), and the
+    /// projection folds both from one ordered source — so every assertion here
+    /// is made the instant the status is observable, with nothing waited for
+    /// in between. Neither the Hosts sheet nor Agent detail can present a
+    /// number the current connection never proved, and neither is left blank
+    /// while it has one.
+    @Test func hostLatencyIsPairedWithTheConnectionThatMeasuredIt() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Host should report connected") {
+            store.hostStatuses[host.id] == .connected
+        }
+        // Not waited for: the connect ping answered before `.connected` was
+        // published, so the number is already here.
+        #expect(store.hostLatencies[host.id] != nil)
+
+        await store.suspend()
+        try await waitUntil("the Host should report suspended") {
+            store.hostStatuses[host.id] == .suspended
+        }
+        // Absent, not zero and not the previous measurement: the Host is
+        // still in the catalog, only its proof is gone.
+        #expect(store.hostLatencies[host.id] == nil)
+
+        // Hold the replacement connection's ping open. Any latency published
+        // in this window could only be the suspended connection's.
+        let gate = ScriptedTransportCallGate()
+        await transport.gateNextPing(using: gate)
+        await store.resume()
+        try await waitUntil("the replacement connection should be pinging") {
+            await gate.entryCount == 1
+        }
+        #expect(store.hostLatencies[host.id] == nil)
+
+        await gate.open()
+        try await waitUntil("the reconnected Host should report connected") {
+            store.hostStatuses[host.id] == .connected
+        }
+        #expect(store.hostLatencies[host.id] != nil)
+
+        store.setHosts([])
+    }
+
+    @Test func resumedHostStaysLoadingUntilItsReplacementSnapshotLands() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1", status: .working)]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial Agent should arrive") {
+            store.agents.map(\.agent.paneID) == ["w1:p1"]
+        }
+        #expect(!store.hostsAwaitingSnapshot.contains(host.id))
+
+        await store.suspend()
+        try await waitUntil("suspension should invalidate the old snapshot") {
+            store.hostStatuses[host.id] == .suspended && store.agents.isEmpty
+        }
+        #expect(store.hostsAwaitingSnapshot.contains(host.id))
+
+        let snapshotGate = ScriptedTransportCallGate()
+        await transport.gateNextSnapshot(using: snapshotGate)
+        await store.resume()
+        try await waitUntil("the replacement snapshot should be in flight") {
+            let snapshotEntered = await snapshotGate.entryCount == 1
+            return store.hostStatuses[host.id] == .connected && snapshotEntered
+        }
+
+        #expect(store.agents.isEmpty)
+        #expect(store.hostsAwaitingSnapshot.contains(host.id))
+
+        await snapshotGate.open()
+        try await waitUntil("the replacement snapshot should restore the Agent") {
+            store.agents.map(\.agent.paneID) == ["w1:p1"]
+                && !store.hostsAwaitingSnapshot.contains(host.id)
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func retryHostReconnectsOnlyTheRequestedFailedHost() async throws {
+        let hostA = Host.fixture(name: "alpha", address: "a.example")
+        let hostB = Host.fixture(name: "beta", address: "b.example")
+        let transportA = ScriptedTransport(snapshot: .fixture())
+        let transportB = ScriptedTransport(snapshot: .fixture())
+        let queues = [
+            hostA.id: ConnectionAttemptQueue([
+                .failure(.authenticationFailed),
+                .success(transportA),
+            ]),
+            hostB.id: ConnectionAttemptQueue([
+                .failure(.authenticationFailed),
+                .success(transportB),
+            ]),
+        ]
+        let store = ConsoleStore(snapshotRetryDelay: .milliseconds(10)) {
+            host, subscriptions in
+            EventsSession(
+                subscriptions: subscriptions,
+                connect: {
+                    guard let queue = queues[host.id] else {
+                        throw TransportError.sshUnreachable(detail: "unscripted host")
+                    }
+                    return try await queue.next()
+                },
+                reconnectPolicy: Self.fastPolicy,
+                keepalive: nil)
+        }
+
+        store.setHosts([hostA, hostB])
+        await store.resume()
+        try await waitUntil("both Hosts should stop on authentication failure") {
+            store.hostStatuses[hostA.id] == .failed(.authenticationFailed)
+                && store.hostStatuses[hostB.id] == .failed(.authenticationFailed)
+        }
+
+        await store.retryHost(hostA.id)
+        try await waitUntil("only the requested Host should reconnect") {
+            store.hostStatuses[hostA.id] == .connected
+        }
+
+        #expect(store.hostStatuses[hostB.id] == .failed(.authenticationFailed))
+        #expect(await queues[hostA.id]?.attemptCount == 2)
+        #expect(await queues[hostB.id]?.attemptCount == 1)
+        #expect(await transportB.capturedSubscriptions.isEmpty)
+
+        store.setHosts([])
+    }
+
+    @Test func retryHostRestartsOnlyTheRequestedConnectedHost() async throws {
+        let hostA = Host.fixture(name: "alpha", address: "a.example")
+        let hostB = Host.fixture(name: "beta", address: "b.example")
+        let queues = [
+            hostA.id: ConnectionAttemptQueue([
+                .success(ScriptedTransport(snapshot: .fixture())),
+                .success(ScriptedTransport(snapshot: .fixture())),
+            ]),
+            hostB.id: ConnectionAttemptQueue([
+                .success(ScriptedTransport(snapshot: .fixture())),
+            ]),
+        ]
+        let store = ConsoleStore(snapshotRetryDelay: .milliseconds(10)) {
+            host, subscriptions in
+            EventsSession(
+                subscriptions: subscriptions,
+                connect: {
+                    guard let queue = queues[host.id] else {
+                        throw TransportError.sshUnreachable(detail: "unscripted host")
+                    }
+                    return try await queue.next()
+                },
+                reconnectPolicy: Self.fastPolicy,
+                keepalive: nil)
+        }
+
+        store.setHosts([hostA, hostB])
+        await store.resume()
+        try await waitUntil("both Hosts should connect") {
+            store.hostStatuses[hostA.id] == .connected
+                && store.hostStatuses[hostB.id] == .connected
+        }
+
+        await store.retryHost(hostA.id)
+        try await waitUntil("the requested Host should start a new connection") {
+            await queues[hostA.id]?.attemptCount == 2
+        }
+
+        #expect(await queues[hostB.id]?.attemptCount == 1)
+
+        store.setHosts([])
+    }
+
+    @Test func eventChannelReconnectReusesHostConnectionGeneration() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial subscribe cycle should settle") {
+            let subscriptions = await transport.capturedSubscriptions
+            return subscriptions.count >= 2
+                && store.hostStatuses[host.id] == .connected
+        }
+        #expect(store.hostConnectionGenerations[host.id] == 0)
+
+        await transport.failEventStream(.channelFailed(detail: "connection dropped"))
+        try await waitUntil("the event channel should reconnect on the same transport") {
+            let subscriptions = await transport.capturedSubscriptions
+            return subscriptions.count >= 3
+                && store.hostStatuses[host.id] == .connected
+        }
+        #expect(store.hostConnectionGenerations[host.id] == 0)
+
+        store.setHosts([])
+    }
+
+    @Test func subscriptionResubscribeDoesNotAdvanceConnectionGeneration() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")]))
+        let store = makeStore(transports: [host.id: transport])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the initial subscribe cycle should settle") {
+            let snapshotCount = await transport.snapshotFetchCount
+            let subscriptions = await transport.capturedSubscriptions
+            return snapshotCount >= 2 && subscriptions.count >= 2
+        }
+        let snapshotsBeforeMembershipChange = await transport.snapshotFetchCount
+
+        await transport.setSnapshot(
+            .fixture(agents: [
+                .fixture(paneID: "w1:p1"),
+                .fixture(paneID: "w1:p2"),
+            ]))
+        #expect(
+            await transport.emit(
+                HerdrEvent(kind: GlobalEventKind.paneAgentDetected.kind, data: .object([:])))
+                == true)
+        try await waitUntil("the changed pane subscription should reconnect its event stream") {
+            let subscriptions = await transport.capturedSubscriptions
+            let snapshotCount = await transport.snapshotFetchCount
+            return snapshotCount >= snapshotsBeforeMembershipChange + 2
+                && subscriptions.last?.contains(
+                    .pane(.agentStatusChanged, paneID: "w1:p2")) == true
+                && store.hostStatuses[host.id] == .connected
+        }
+        #expect(store.hostConnectionGenerations[host.id] == 0)
+
+        store.setHosts([])
+    }
+
+    @Test func linkedWorktreeRemovalRecordsOnlyItsAffectedAgents() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: linkedWorktreeSnapshot(
+                workspaces: [
+                    ("w1", "one", "/work/one-wt"),
+                    ("w2", "two", "/work/two-wt"),
+                ]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("both linked-worktree Agents should arrive") {
+            store.agents.count == 2
+        }
+        let first = try #require(store.agents.first { $0.agent.workspaceID == "w1" })
+        let checkout = try #require(first.repositoryCheckout)
+        let request = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id, workspaceID: "w1", checkout: checkout))
+        let unaffected = try #require(store.agents.first { $0.agent.workspaceID == "w2" })
+        await transport.setSnapshot(
+            linkedWorktreeSnapshot(workspaces: [("w2", "two", "/work/two-wt")]))
+
+        let receipt = try await store.removeWorktree(request, on: host.id)
+
+        #expect(await transport.removedWorktreeRequests == [request])
+        #expect(receipt.affectedAgentIDs == [first.id])
+        try await waitUntil("the post-removal snapshot should retain only the unaffected Agent") {
+            store.agents.map(\.id) == [unaffected.id]
+                && store.removedWorktreesByAgent[first.id] == receipt
+                && store.removedWorktreesByAgent[unaffected.id] == nil
+        }
+        store.setHosts([])
+    }
+
+    @Test func staleIdentityAtTheWriteBoundarySendsNoRemoval() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: linkedWorktreeSnapshot(workspaces: [("w1", "one", "/work/one-wt")]))
+        let gate = ScriptedTransportCallGate()
+        await transport.gateNextWorktreeAuthorization(using: gate)
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the linked-worktree Agent should arrive") {
+            store.agents.first?.isLinkedWorktree == true
+        }
+        let agent = try #require(store.agents.first)
+        let checkout = try #require(agent.repositoryCheckout)
+        let request = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id, workspaceID: "w1", checkout: checkout))
+        let removal = Task { try await store.removeWorktree(request, on: host.id) }
+
+        try await waitUntil("remove should be waiting immediately before authorization") {
+            await gate.entryCount == 1
+        }
+        await transport.setSnapshot(
+            linkedWorktreeSnapshot(workspaces: [("w1", "replacement", "/work/reused-wt")]))
+        #expect(
+            await transport.emit(
+                HerdrEvent(
+                    kind: GlobalEventKind.workspaceMetadataUpdated.kind,
+                    data: .object([:]))) == true)
+        try await waitUntil("the replacement identity should become the latest snapshot") {
+            store.agents.first?.checkoutPath == "/work/reused-wt"
+        }
+        await gate.open()
+
+        await #expect(throws: WorktreeRemovalError.staleIdentity) {
+            try await removal.value
+        }
+        #expect(await transport.removedWorktreeRequests.isEmpty)
+        #expect(store.removedWorktreesByAgent.isEmpty)
+        store.setHosts([])
+    }
+
+    @Test func canonicalizedRemovalPathDoesNotOverrideWorkspaceIdentity() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: linkedWorktreeSnapshot(workspaces: [("w1", "one", "/var/work/one-wt")]))
+        await transport.setWorktreeRemoveResponsePath("/private/var/work/one-wt")
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the linked-worktree Agent should arrive") {
+            store.agents.first?.isLinkedWorktree == true
+        }
+        let agent = try #require(store.agents.first)
+        let request = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id,
+                workspaceID: "w1",
+                checkout: try #require(agent.repositoryCheckout)))
+
+        let receipt = try await store.removeWorktree(request, on: host.id)
+
+        #expect(receipt.request == request)
+        #expect(await transport.removedWorktreeRequests == [request])
+        store.setHosts([])
+    }
+
+    @Test func laterSnapshotPrunesReceiptForRecreatedExactIdentity() async throws {
+        let host = Host.fixture()
+        let linked = linkedWorktreeSnapshot(
+            workspaces: [("w1", "one", "/work/one-wt")])
+        let transport = ScriptedTransport(snapshot: linked)
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the original linked-worktree Agent should arrive") {
+            store.agents.first?.isLinkedWorktree == true
+        }
+        let agent = try #require(store.agents.first)
+        let request = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id,
+                workspaceID: "w1",
+                checkout: try #require(agent.repositoryCheckout)))
+        await transport.setSnapshot(.fixture())
+
+        _ = try await store.removeWorktree(request, on: host.id)
+        try await waitUntil("the absent snapshot should retain the removal receipt") {
+            store.agents.isEmpty && store.removedWorktreesByAgent[agent.id]?.request == request
+        }
+
+        await transport.setSnapshot(linked)
+        #expect(
+            await transport.emit(
+                HerdrEvent(
+                    kind: GlobalEventKind.workspaceMetadataUpdated.kind,
+                    data: .object([:]))) == true)
+        try await waitUntil("the recreated exact identity should clear the old receipt") {
+            store.agents.first?.repositoryCheckout == agent.repositoryCheckout
+                && store.removedWorktreesByAgent[agent.id] == nil
+        }
+        store.setHosts([])
+    }
+
+    @Test func staleInflightSnapshotCannotPruneNewRemovalReceipt() async throws {
+        let host = Host.fixture()
+        let linked = linkedWorktreeSnapshot(
+            workspaces: [("w1", "one", "/work/one-wt")])
+        let transport = ScriptedTransport(snapshot: linked)
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the pane subscription should settle") {
+            await transport.capturedSubscriptions.last?.contains(
+                .pane(.agentStatusChanged, paneID: "w1:p1")) == true
+        }
+        let agent = try #require(store.agents.first)
+        let request = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id,
+                workspaceID: "w1",
+                checkout: try #require(agent.repositoryCheckout)))
+
+        let staleSnapshotGate = ScriptedTransportCallGate()
+        await transport.gateNextSnapshot(using: staleSnapshotGate)
+        #expect(
+            await transport.emit(
+                HerdrEvent(
+                    kind: GlobalEventKind.workspaceMetadataUpdated.kind,
+                    data: .object([:]))) == true)
+        try await waitUntil("the pre-removal snapshot should be in flight") {
+            await staleSnapshotGate.entryCount == 1
+        }
+
+        let convergenceSnapshotGate = ScriptedTransportCallGate()
+        await transport.setSnapshot(.fixture())
+        await transport.gateNextSnapshot(using: convergenceSnapshotGate)
+        let receipt = try await store.removeWorktree(request, on: host.id)
+        #expect(store.removedWorktreesByAgent[agent.id] == receipt)
+
+        await staleSnapshotGate.open()
+        try await waitUntil("the post-removal convergence snapshot should start") {
+            await convergenceSnapshotGate.entryCount == 1
+        }
+        #expect(store.agents.first?.repositoryCheckout == agent.repositoryCheckout)
+        #expect(store.removedWorktreesByAgent[agent.id] == receipt)
+        #expect(
+            RemovedWorktreeSelection.receipt(
+                for: agent.id,
+                agents: store.agents,
+                receipts: store.removedWorktreesByAgent) == receipt)
+
+        await convergenceSnapshotGate.open()
+        try await waitUntil("the post-removal snapshot should converge") {
+            store.agents.isEmpty && store.removedWorktreesByAgent[agent.id] == receipt
+        }
+        #expect(
+            RemovedWorktreeSelection.receipt(
+                for: agent.id,
+                agents: store.agents,
+                receipts: store.removedWorktreesByAgent) == receipt)
+        store.setHosts([])
+    }
+
+    @Test func repeatedAndConcurrentRemovalRequestsStayDistinct() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: linkedWorktreeSnapshot(
+                workspaces: [
+                    ("w1", "one", "/work/one-wt"),
+                    ("w2", "two", "/work/two-wt"),
+                ]))
+        let gate = ScriptedTransportCallGate()
+        await transport.gateNextWorktreeAuthorization(using: gate)
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("both Agents should arrive") { store.agents.count == 2 }
+        let one = try #require(store.agents.first { $0.agent.workspaceID == "w1" })
+        let two = try #require(store.agents.first { $0.agent.workspaceID == "w2" })
+        let requestOne = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id,
+                workspaceID: "w1",
+                checkout: try #require(one.repositoryCheckout)))
+        let requestTwo = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id,
+                workspaceID: "w2",
+                checkout: try #require(two.repositoryCheckout)))
+        let first = Task { try await store.removeWorktree(requestOne, on: host.id) }
+        try await waitUntil("the first request should wait at authorization") {
+            await gate.entryCount == 1
+        }
+
+        await #expect(throws: WorktreeRemovalError.alreadyInProgress) {
+            try await store.removeWorktree(requestOne, on: host.id)
+        }
+        let second = Task { try await store.removeWorktree(requestTwo, on: host.id) }
+        await gate.open()
+        _ = try await first.value
+        _ = try await second.value
+
+        let requests = await transport.removedWorktreeRequests
+        #expect(requests.count == 2)
+        #expect(Set(requests) == [requestOne, requestTwo])
+        store.setHosts([])
+    }
+
+    @Test func serverAndTransportFailuresHaveDeterministicOutcomes() async throws {
+        let host = Host.fixture()
+        let transport = ScriptedTransport(
+            snapshot: linkedWorktreeSnapshot(workspaces: [("w1", "one", "/work/one-wt")]))
+        let store = makeStore(transports: [host.id: transport])
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the Agent should arrive") { store.agents.count == 1 }
+        let agent = try #require(store.agents.first)
+        let checkout = try #require(agent.repositoryCheckout)
+
+        await transport.setWorktreeRemoveFailure(
+            HerdrAPIError(
+                code: "dirty_worktree_requires_force",
+                message:
+                    "fatal: '/work/one-wt' contains modified or untracked files, use --force to delete it"))
+        let rejected = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id, workspaceID: "w1", checkout: checkout))
+        await #expect(throws: HerdrAPIError.self) {
+            try await store.removeWorktree(rejected, on: host.id)
+        }
+        #expect(store.removedWorktreesByAgent.isEmpty)
+
+        await transport.setWorktreeRemoveFailure(TransportError.timedOut)
+        await transport.setSnapshot(.fixture())
+        let uncertain = WorktreeRemovalRequest(
+            identity: WorktreeIdentity(
+                hostID: host.id, workspaceID: "w1", checkout: checkout))
+        await #expect(throws: WorktreeRemovalError.outcomeUnconfirmed) {
+            try await store.removeWorktree(uncertain, on: host.id)
+        }
+        try await waitUntil("a newer absent snapshot should resolve the exact removal") {
+            store.removedWorktreesByAgent[agent.id]?.request == uncertain
+        }
+        store.setHosts([])
+    }
+
+    private func linkedWorktreeSnapshot(
+        workspaces: [(id: String, name: String, path: String)]
+    ) -> SessionSnapshot {
+        .fixture(
+            agents: workspaces.map {
+                .fixture(paneID: "\($0.id):p1", workspaceID: $0.id)
+            },
+            workspaces: workspaces.map {
+                .fixture(
+                    workspaceID: $0.id,
+                    label: $0.name,
+                    repoName: $0.name,
+                    checkoutPath: $0.path,
+                    isLinkedWorktree: true)
+            })
+    }
+
+    /// A store whose session factory hands each Host the next transport in
+    /// its scripted sequence, so tests can drive SSH-level replacement.
+    private func makeStore(transportQueues: [Host.ID: TransportQueue]) -> ConsoleStore {
+        ConsoleStore(snapshotRetryDelay: .milliseconds(10)) { host, subscriptions in
+            EventsSession(
+                subscriptions: subscriptions,
+                connect: {
+                    guard let queue = transportQueues[host.id] else {
+                        throw TransportError.sshUnreachable(detail: "unscripted host")
+                    }
+                    return try await queue.next()
+                },
+                reconnectPolicy: Self.fastPolicy,
+                keepalive: nil)
+        }
+    }
+
+    @Test func transportReplacementAdvancesHostConnectionGeneration() async throws {
+        // The one path that must advance the projected generation: the SSH
+        // connection dies and the session installs a replacement Transport.
+        // This is the detail screen's only automatic-reattach trigger.
+        let host = Host.fixture()
+        let first = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")]))
+        let second = ScriptedTransport(
+            snapshot: .fixture(agents: [.fixture(paneID: "w1:p1")]))
+        let store = makeStore(
+            transportQueues: [host.id: TransportQueue([first, second])])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the first transport should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+        #expect(store.hostConnectionGenerations[host.id] == 0)
+
+        // Kill the SSH connection outright: the stream ends and
+        // `isConnected` flips false, so the reconnect must replace the
+        // Transport instead of resubscribing on it.
+        try await first.close()
+        try await waitUntil("the replacement transport should connect") {
+            let resubscribed = await second.capturedSubscriptions.isEmpty == false
+            return resubscribed && store.hostStatuses[host.id] == .connected
+        }
+        try await waitUntil("the projected generation should advance") {
+            store.hostConnectionGenerations[host.id] == 1
+        }
+
+        store.setHosts([])
+    }
+
+    @Test func terminalRunnerAndImageStagerSurviveAHostEdit() async throws {
+        // The Attach screen holds its runner and stager for its whole
+        // lifetime. Editing the Host replaces the projection and ends its
+        // session; a call through the old handles must resolve the live
+        // projection instead of staying bound to the ended session.
+        let host = Host.fixture(name: "alpha")
+        let first = ScriptedTransport(snapshot: .fixture())
+        let second = ScriptedTransport(snapshot: .fixture())
+        let store = makeStore(
+            transportQueues: [host.id: TransportQueue([first, second])])
+
+        store.setHosts([host])
+        await store.resume()
+        try await waitUntil("the first transport should connect") {
+            store.hostStatuses[host.id] == .connected
+        }
+        let runner = store.terminalRunner(for: host.id)
+        let stager = store.imageStager(for: host.id)
+
+        var edited = host
+        edited.name = "alpha (renamed)"
+        store.setHosts([edited])
+        try await waitUntil("the replacement projection should connect") {
+            let resubscribed = await second.capturedSubscriptions.isEmpty == false
+            return resubscribed && store.hostStatuses[host.id] == .connected
+        }
+
+        let request = TerminalAttachRequest(target: "w1:p1", cols: 80, rows: 24)
+        try await runner(request, TerminalSessionHandler { _ in })
+        #expect(await second.attachRequests == [request])
+        #expect(await first.attachRequests.isEmpty)
+
+        let prepared = PreparedImage(
+            fileURL: URL(fileURLWithPath: "/tmp/attach-test.jpg"),
+            format: .jpeg, pixelWidth: 16, pixelHeight: 16, byteCount: 128)
+        await second.configureImageStaging(
+            outcomes: [.success(try StagedImage(path: "/tmp/staged/attach-test.jpg"))])
+        let staged = try await stager(prepared, AttachmentStageProgressReporter { _ in })
+        #expect(staged.path == "/tmp/staged/attach-test.jpg")
+        #expect(await second.stageRequests.count == 1)
+        #expect(await first.stageRequests.isEmpty)
+
+        store.setHosts([])
+    }
+}
+
+/// Hands out scripted transports in order, one per `connect`, so tests can
+/// drive SSH-level replacement deterministically.
+private actor TransportQueue {
+    private var remaining: [ScriptedTransport]
+
+    init(_ transports: [ScriptedTransport]) {
+        remaining = transports
+    }
+
+    func next() throws -> ScriptedTransport {
+        guard !remaining.isEmpty else {
+            throw TransportError.sshUnreachable(detail: "transport queue exhausted")
+        }
+        return remaining.removeFirst()
+    }
+}
+
+/// Scripts both failed and successful connection attempts for manual retry
+/// tests while recording exactly which Host was retried.
+private actor ConnectionAttemptQueue {
+    private var remaining: [Result<ScriptedTransport, TransportError>]
+    private(set) var attemptCount = 0
+
+    init(_ attempts: [Result<ScriptedTransport, TransportError>]) {
+        remaining = attempts
+    }
+
+    func next() throws -> ScriptedTransport {
+        attemptCount += 1
+        guard !remaining.isEmpty else {
+            throw TransportError.sshUnreachable(detail: "connection queue exhausted")
+        }
+        return try remaining.removeFirst().get()
+    }
+}
+
+/// Captures the session a store's factory built, so overflow tests can
+/// observe its drop diagnostics.
+private actor SessionBox {
+    private(set) var session: EventsSession?
+
+    func set(_ session: EventsSession) {
+        self.session = session
+    }
+}
+
+private actor TerminalTeardownGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    private(set) var enteredCount = 0
+
+    func waitUntilOpen() async {
+        enteredCount += 1
+        if isOpen { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let resuming = waiters
+        waiters.removeAll()
+        for waiter in resuming { waiter.resume() }
+    }
+}
+
+private actor TerminalOperationResult {
+    private(set) var wasSet = false
+
+    func set() {
+        wasSet = true
+    }
+}

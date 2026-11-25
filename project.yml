@@ -1,0 +1,305 @@
+name: Mercurio
+attributes:
+  ORGANIZATIONNAME: Ormus Solutions
+options:
+  bundleIdPrefix: solutions.ormus
+  deploymentTarget:
+    iOS: "18.0"
+  createIntermediateGroups: true
+  minimumXcodeGenVersion: "2.42.0"
+
+settings:
+  base:
+    # Swift 6 language mode implies complete strict concurrency checking.
+    SWIFT_VERSION: "6.0"
+    SWIFT_STRICT_CONCURRENCY: complete
+    # Left empty on purpose: signing needs your own Apple Developer team.
+    # `make install TEAM=<your team id>` passes it on the command line, or
+    # run scripts/set-signing.sh once (README, "Build and install").
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+
+packages:
+  # Repository-local package owning the libssh2/OpenSSL implementation and
+  # checked-in native artifacts. The one SSH backend (ADR 0011).
+  HeelerSSH:
+    path: Packages/HeelerSSH
+  # Repository-local package running Tailscale, ZeroTier, and EasyTier nodes
+  # in-process. It only dials byte streams for HeelerSSH; it never replaces
+  # the SSH backend (ADR 0021). Its native libraries come from an exact
+  # release of heeler-overlay-natives, pinned in its own Package.swift.
+  HeelerOverlay:
+    path: Packages/HeelerOverlay
+  # Pin the reviewed 1.6.20260909 source commit. Its prebuilt libghostty is
+  # Ghostty 82938b633ba6 with SwiftPM checksum
+  # 2d9a26e80c3836c450f03ea2cf9d191841d9093d4f61c1cea466d2fc8e215dbb.
+  GhosttyTerminal:
+    url: https://github.com/Lakr233/libghostty-spm.git
+    revision: "7e45d27160f9b34aca9ca5c9820e9207482f9f04"
+
+targets:
+  Heeler:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/Heeler
+        excludes:
+          # Bundled as a folder reference below so notice files stay under
+          # Notices/ in the app bundle rather than flattening to the root.
+          - Resources/Notices
+      # Notification code shared with the service extension: envelope
+      # decryption, Notification Key store, alert renderer (ADR 0008).
+      - Sources/HeelerNotificationCore
+      # Live Activity attributes + details envelope (shared with HeelerWidgets).
+      - Sources/HeelerActivityCore
+      # Widget views double-included so Xcode can host their #Preview gallery
+      # in the app target (plain previews are unsupported inside app-extension
+      # targets); the @main WidgetBundle stays extension-only.
+      - Sources/HeelerWidgets/AgentLiveActivityWidget.swift
+      - Sources/HeelerWidgets/AgentActivityDecryptor.swift
+      # Audited third-party notices + inventory.json (#161). Folder reference
+      # preserves the Notices/ subdirectory the catalogue resolves against.
+      - path: Sources/Heeler/Resources/Notices
+        type: folder
+        buildPhase: resources
+    info:
+      path: Sources/Heeler/Info.plist
+      properties:
+        # XcodeGen would otherwise hardcode 1.0/1 here, and a file value wins
+        # over the generated one; keep both versions on the build settings.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # The commit a distributed build was made from, shown in About ›
+        # Acknowledgements (BuildSourceRevision). `make archive` sets it;
+        # other builds leave it empty.
+        MercurioSourceRevision: $(MERCURIO_SOURCE_REVISION)
+        # A dragged Console row carries this activity; iPadOS creates a new
+        # window from it only for a declared type. The generated scene
+        # manifest already declares multiple-scene support.
+        NSUserActivityTypes:
+          - solutions.ormus.mercurio.agent
+        # `heeler://agent` links (AgentActivityLink). A Live Activity tap
+        # opens its own app without this; other apps' links need it.
+        CFBundleURLTypes:
+          - CFBundleURLName: solutions.ormus.mercurio
+            CFBundleURLSchemes:
+              - mercurio
+    entitlements:
+      path: Sources/Heeler/Heeler.entitlements
+      properties:
+        # Development here covers Debug/local device builds (sandbox APNs);
+        # App Store / TestFlight re-signing flips it to production, so the
+        # APNs environment follows the build configuration (#71).
+        aps-environment: development
+        # Shared with the Notification Service Extension; doubles as the
+        # Keychain access group holding the Notification Keys.
+        com.apple.security.application-groups:
+          - group.solutions.ormus.mercurio.shared
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: solutions.ormus.mercurio
+        # Installed bundle and Swift module. Tests import Mercurio.
+        PRODUCT_NAME: Mercurio
+        # Home-screen name.
+        INFOPLIST_KEY_CFBundleDisplayName: Mercurio
+        MARKETING_VERSION: "0.1.15"
+        CURRENT_PROJECT_VERSION: "28"
+        # Scan to Pair (#62) reads the Pairing Code QR from the computer screen.
+        INFOPLIST_KEY_NSCameraUsageDescription: "Mercurio uses the camera to scan the Pairing Code shown on your computer, so you can add that machine without typing anything."
+        # Only exempt encryption is used: standard, published algorithms in
+        # SSH (the HeelerSSH package's libssh2/OpenSSL), OS-provided
+        # CryptoKit, and the overlay networks' protocols (WireGuard in
+        # Tailscale, ZeroTier's, and EasyTier's, ADR 0021). Declaring it here
+        # keeps every TestFlight upload from stalling on the Missing
+        # Compliance prompt.
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: NO
+        # iPhone and iPad. App Store Connect derives device support from the build.
+        TARGETED_DEVICE_FAMILY: "1,2"
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        # ActivityKit starts Live Activities from the app; HeelerWidgets renders them.
+        INFOPLIST_KEY_NSSupportsLiveActivities: YES
+        # In-app overlay nodes (ADR 0021) find peers on the same LAN for direct
+        # paths; iOS asks before the first local-network packet.
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Mercurio uses your local network to connect directly to Hosts on your Tailscale, ZeroTier, or EasyTier network when they are nearby."
+        MERCURIO_SOURCE_REVISION: ""
+        # The catalog holds only the app icon's pre-rendered 1024px images;
+        # space-optimized encoding stays lossless and saves ~0.46 MB per
+        # device. Decoding is the system's, at icon render time.
+        ASSETCATALOG_COMPILER_OPTIMIZATION: space
+      configs:
+        Release:
+          # Nothing loads symbols from the app executable, so its 1.52 MB
+          # export trie, mostly CEasyTier's Rust symbols, is dead weight.
+          # Release only; Debug's test host and debug dylib need it.
+          LD_EXPORT_SYMBOLS: NO
+    dependencies:
+      - package: HeelerSSH
+      - package: HeelerOverlay
+      - package: GhosttyTerminal
+      - package: GhosttyTerminal
+        product: GhosttyTheme
+      - target: HeelerNotificationService
+      - target: HeelerWidgets
+
+  # Decrypts Agent Notifications before display (ADR 0008, #71). A thin
+  # shell: the logic lives in HeelerNotificationCore, tested from the app
+  # suite. The extension cannot link the app, so the shared sources (and the
+  # few app files they lean on) are compiled in directly.
+  HeelerNotificationService:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/HeelerNotificationService
+      - Sources/HeelerNotificationCore
+      - Sources/Heeler/Support/Base64URL.swift
+      - Sources/Heeler/Transport/SecretStore.swift
+      # For AgentStatus; Foundation-only by construction (JSONValue is the
+      # generated file's one in-repo dependency).
+      - Sources/Heeler/Transport/Generated/HerdrAPITypes.swift
+      - Sources/Heeler/Transport/JSONValue.swift
+    entitlements:
+      path: Sources/HeelerNotificationService/HeelerNotificationService.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.solutions.ormus.mercurio.shared
+    info:
+      path: Sources/HeelerNotificationService/Info.plist
+      properties:
+        # An app extension's versions must match its containing app's, or
+        # App Store validation rejects the bundle. XcodeGen would otherwise
+        # hardcode its own 1.0/1 defaults here; point at the build settings
+        # so both bundles stay in lockstep.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # App Store validation (code 90360) requires a display name on
+        # every embedded appex; never user-visible for this extension.
+        CFBundleDisplayName: Mercurio Notification Service
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.usernotifications.service
+          NSExtensionPrincipalClass: $(PRODUCT_MODULE_NAME).NotificationService
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: solutions.ormus.mercurio.NotificationService
+        MARKETING_VERSION: "0.1.15"
+        CURRENT_PROJECT_VERSION: "28"
+        # Match the containing app's iPhone and iPad device family.
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  # Lock-screen / Dynamic Island Live Activity (docs/agents/live-activity-contract.md).
+  # Thin WidgetKit shell: attributes, envelope open, and Notification Key
+  # selection live in HeelerActivityCore / HeelerNotificationCore, compiled
+  # in the same way as the notification service extension (the appex cannot
+  # link the app). @main is the WidgetBundle; there is no principal class.
+  HeelerWidgets:
+    type: app-extension
+    platform: iOS
+    sources:
+      - Sources/HeelerWidgets
+      - Sources/HeelerActivityCore
+      - Sources/HeelerNotificationCore
+      - Sources/Heeler/Support/Base64URL.swift
+      - Sources/Heeler/Transport/SecretStore.swift
+      # For AgentStatus; Foundation-only by construction (JSONValue is the
+      # generated file's one in-repo dependency). NotificationEnvelope in
+      # HeelerNotificationCore needs it.
+      - Sources/Heeler/Transport/Generated/HerdrAPITypes.swift
+      - Sources/Heeler/Transport/JSONValue.swift
+      # Shared with the app Console; single hex owner for status colors (#247).
+      - Sources/Heeler/Console/AgentStatusPalette.swift
+    entitlements:
+      path: Sources/HeelerWidgets/HeelerWidgets.entitlements
+      properties:
+        com.apple.security.application-groups:
+          - group.solutions.ormus.mercurio.shared
+    info:
+      path: Sources/HeelerWidgets/Info.plist
+      properties:
+        # An app extension's versions must match its containing app's, or
+        # App Store validation rejects the bundle. XcodeGen would otherwise
+        # hardcode its own 1.0/1 defaults here; point at the build settings
+        # so both bundles stay in lockstep.
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        # App Store validation (code 90360) requires a display name on
+        # every embedded appex. Also the counts-only lock-screen fallback.
+        CFBundleDisplayName: Mercurio
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: solutions.ormus.mercurio.Widgets
+        MARKETING_VERSION: "0.1.15"
+        CURRENT_PROJECT_VERSION: "28"
+        # Match the containing app's iPhone and iPad device family.
+        TARGETED_DEVICE_FAMILY: "1,2"
+
+  HeelerTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: Tests/HeelerTests
+        excludes:
+          # Bundled as a folder reference below so the captured transcripts
+          # and screens keep their directory layout instead of flattening
+          # (and colliding) at the bundle root.
+          - ChatFixtures
+      - path: Tests/HeelerTests/ChatFixtures
+        type: folder
+        buildPhase: resources
+      # Shared Pairing Code vectors (ADR 0007): the same file the Node plugin
+      # tests consume, bundled so the Swift tests cannot drift from it.
+      - path: plugin/test-vectors/pairing-code-v1.json
+        buildPhase: resources
+      # Pairing Code v2 vectors (ADR 0021): Swift-only, the Node plugin emits v1.
+      - path: plugin/test-vectors/pairing-code-v2.json
+        buildPhase: resources
+      # Shared notification envelope vectors (ADR 0008), same arrangement.
+      - path: plugin/test-vectors/notification-payload-v1.json
+        buildPhase: resources
+      # Shared Live Activity details envelope vectors, same arrangement.
+      - path: plugin/test-vectors/live-activity-content-v1.json
+        buildPhase: resources
+      # Shared sidebar layout snapshot vectors, consumed by Node and Swift.
+      - path: plugin/test-vectors/sidebar-layout-v1.json
+        buildPhase: resources
+      # Shared notification session vectors (#412), consumed by Node and Swift.
+      - path: plugin/test-vectors/notification-session-v1.json
+        buildPhase: resources
+      # Shared plugin version vector: the release the app recommends.
+      - path: plugin/test-vectors/plugin-version-v1.json
+        buildPhase: resources
+      # Ormus faces, so a unit test can register them without the app host.
+      - path: Sources/Heeler/Resources/Fonts
+        buildPhase: resources
+    settings:
+      base:
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: solutions.ormus.mercurio.tests
+    dependencies:
+      - target: Heeler
+      - package: HeelerSSH
+      - package: HeelerOverlay
+      - package: GhosttyTerminal
+
+schemes:
+  Mercurio:
+    build:
+      targets:
+        Heeler: all
+    test:
+      targets:
+        - HeelerTests
+      # The only variable the app test process needs from the invoking shell.
+      # The fixture itself arrives through the Simulator's launchd environment
+      # as HEELER_SSH_E2E_CONFIG / HEELER_SSH_JUMP_E2E_CONFIG /
+      # HEELER_PAIRING_E2E_CONFIG, which must stay off this list: an entry here
+      # is forwarded unconditionally, substituting an empty string when the
+      # shell has not exported it, and would shadow the launchd value.
+      environmentVariables:
+        HEELER_SSH_E2E_REQUIRED: $(HEELER_SSH_E2E_REQUIRED)
+    run:
+      config: Debug

@@ -1,0 +1,1491 @@
+# Changelog
+
+All notable changes to Heeler are documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
+Entries reference the pull request that made the change.
+
+## [Unreleased]
+
+### Changed
+
+- `make install`, `make build` and `make archive` need your own Apple
+  Developer team: pass `TEAM=<team id>`, or run `scripts/set-signing.sh <team>
+  <bundle-prefix>` once. The repository no longer names a signing team.
+  Push relay: the herdr plugin has no default relay any more and sends no push
+  until `relay_url` names a relay you run. (#22)
+- Status: this release was prepared and scanned on Linux; the build steps have
+  not yet been run on a Mac for this exact tree. If you build it, please report
+  the result as an issue on the public repository. (#22)
+
+## [0.1.15] - 2026-10-19
+
+### Added
+
+- Collapse the current turn's expanded reasoning and tool details from a
+  floating Chat button, bringing its header back into view without adding
+  blank space below a short last turn. (#464)
+- Extend native Chat to Pi and Oh My Pi Agents, with messages, reasoning,
+  paired tool results, edit diffs, current-branch history and compaction
+  boundaries. Reads the JSONL session path reported by herdr, including custom
+  session directories, and shows a new conversation as empty until its first
+  reply is saved, instead of as missing. Skill invocations show as `/name`
+  commands; Oh My Pi questions keep their options and answers, denied
+  approvals and dismissed questions read as declined, Stop during a Pi tool
+  reads as an interruption, and an Oh My Pi plan proposal reads as ready for
+  review. A message that steers a running turn shows inside it, marked Sent
+  while working, and an Oh My Pi conversation survives Oh My Pi rewriting its
+  session file. Oh My Pi's `$` Python runs show as notices, a file it writes
+  shows its text as added lines ("Wrote 1 file"), its plan hand-off adds no
+  file row, and compaction and branch summaries preview as plain text.
+  Unrecognized input surfaces remain available in the terminal. Extends the
+  Chat infrastructure in #425. (#464)
+- Send to Pi and Oh My Pi from Chat. Chat recognizes Oh My Pi 18.11's
+  nerd-font status band and Pi's editor in any project directory. Pi takes
+  messages while it works, which steer the turn, and a steer that Stop puts
+  back in the input box shows as not delivered; for Oh My Pi, Chat holds a
+  message while a turn runs or an approval or question panel is open. Sending
+  refuses Oh My Pi's exit words, `$` Python, Continue and queue shorthands,
+  and pastes of 100 lines or more. The `/` menu and Skills list offer only
+  skills, sent as `/skill:name`, including Oh My Pi's `.omp/skills`,
+  `~/.omp/agent/skills`, `~/.agents/skills` and `~/.agent/skills`; prompt
+  templates stay in the terminal. (#464)
+- Answer Oh My Pi tool approvals and single-select questions from native
+  Blocked cards. Approve presses ctrl+q once Oh My Pi accepts it and Deny
+  presses Esc; questions are answered with arrow keys, page by page through
+  the review, and the card says so when a draft in Oh My Pi's prompt would
+  take the keys. Multi-select questions and typed answers stay in the
+  terminal. (#464)
+- Approve an Oh My Pi 18.12 tool for the rest of the session from its
+  Blocked card when the approval offers it ("Approve edit for this session").
+  The card moves to that row one arrow key at a time, checking the selection
+  after each, and stops without answering if it doesn't move; a draft in Oh
+  My Pi's prompt leaves this choice to the terminal. (#425)
+- Chat for Claude Code and Codex Agents: the Agent's conversation as native
+  rows in the terminal's place, read from the transcript its program writes on
+  the Host, with nothing installed there. Chat folds finished turns, groups
+  tool calls, shows file changes as diffs, answers Blocked dialogs with native
+  cards, lists background agents and Workflows, and stays readable offline
+  from its cache. Sending checks the Agent's input box before and after and
+  never resends. Chat and the terminal swap from a pair of buttons beside
+  Show Header. Settings › Appearance sets Chat's font (System, Rounded,
+  Serif or Monospaced) and text size, a little smaller than the system's by
+  default. (#425)
+- Pair a Host whose herdr runs outside your own config, such as one bundled
+  in a desktop app, from a version 2 Pairing Code. The Host keeps that
+  herdr's socket and launcher, shows them in Host detail, and runs every
+  connection and herdr command through them, including the commands Heeler
+  suggests for plugin management and forced Worktree removal. macOS and
+  Linux Hosts only. Such a code without a one-time key waits for you to tap
+  Pair, since pairing runs its launcher on the Host. A Pairing Code version
+  this app does not know now asks you to update Heeler. (#432)
+
+### Changed
+
+- Settings › Appearance gathers the app's theme, the terminal's font, text
+  size and themes, and Chat's appearance, in place of the separate
+  Appearance picker and Terminal Appearance page. (#425)
+- The terminal font "System" is now named JetBrains Mono, the face it
+  always drew, and the duplicate JetBrains Mono choice folds into it. Menlo
+  and Courier New join IBM Plex Mono as other choices. (#425)
+- Chat's conversation runs edge to edge: messages scroll under the status
+  bar and behind the Composer down to the home indicator, softening under
+  the chrome instead of stopping at a blank band. (#425)
+- The Agent detail header's Agent Terminal segment shows a code glyph and
+  Workspace Terminals shows stacked terminals, so the two buttons no longer
+  share one icon. (#425)
+- Where Agent detail is pushed over the list (iPhone, or a compact iPad
+  window), Open Terminal in an Agent's More menu opens the Shell Terminal over
+  the Agent, so Back in the terminal's header, or the edge swipe, returns to
+  the Agent's Chat or terminal instead of the Agents list. The Agent's notifications still show as banners there, and
+  tapping one returns to the Agent. Beside the list it still selects the
+  terminal there. (#425)
+- On a connected Host, Agent Gone says the Agent may have exited while its
+  pane stays open, and that the Agent shows again once one starts in that
+  pane. (#425)
+- Chat shows Claude Code narration that its transcript records as thinking as
+  the Agent's text, as the terminal does, rather than as a collapsed Reasoning
+  row. (#425)
+- Chat titles Claude Code task rows by their subject and status ("Task #2:
+  completed") and ToolSearch rows by the tools they loaded ("Loaded
+  WebFetch"). A spawned teammate reads Started, not Done, and choosing "Chat
+  about this" reads Chat Instead, not Declined. (#425)
+- Chat counts a directory listing as a listed folder rather than a search,
+  counts images in a step group without calling them viewed, counts every
+  file a Codex patch touched rather than one per patch, counts a file changed
+  more than once in a group once, under its first change (a file created and
+  then edited reads "Created 1 file"), and folds Codex's waits for subagents
+  into the turn instead of pinning a row for each. (#425)
+- A message that reached a running turn is marked Sent while working instead
+  of Queued, which stays true once the turn ends or is stopped. (#425)
+
+### Fixed
+
+- Chat for an Agent whose Host is offline, with nothing of its conversation
+  saved on the device, says it waits for the Host instead of looking for the
+  conversation forever. (#425)
+- Chat renders Markdown tables as aligned columns with wrapping cells, inline
+  formatting and header styling; wide tables scroll within the message. (#464)
+- Chat restores a saved conversation when a live Agent temporarily omits its
+  session ID, including while the local directory is still loading. (#425)
+- Chat keeps disclosure headers in place while expanding downward, including
+  short conversations, and aligns tool icons with the first title line. (#425)
+- Opening a short last turn no longer leaves its newest rows under the
+  floating Collapse Steps button, where a tap meant for a row collapsed the
+  turn; the list moves up just enough to show them above it. (#425)
+- Chat preloads conversations after connecting, restores saved conversations
+  before contacting the Host, and keeps them available from the Agent list
+  after an offline relaunch while reconnecting. (#425)
+- Chat previews recorded image files on long press, including images a Claude
+  Code Read showed, opens them with zoom, and aligns tool icons with their
+  titles above subtitles. (#425)
+- Chat groups each Subagent's activity into one card per turn, with
+  a Lucide Bot icon beside its title and expandable history, and no longer marks message exchanges
+  as completed work. (#425)
+- Chat explains a missing session ID without incorrectly suggesting that the
+  integration needs installing, and shows failed session queries with a retry
+  while keeping messages already loaded. (#425)
+- Two Agents whose Agents list title or switcher chip reads the same, such as
+  different programs in one Workspace, now show which program each one is
+  ("proj · Pi"). (#425)
+- The app no longer hangs when the Agent switcher reorders its chips after
+  an Agent's status changes, and the strip keeps the open Agent's chip in
+  view when it reorders, such as after an Agent restarts in its pane. (#425)
+- The app no longer hangs on iPhone when going back to the Agents list from
+  an Agent the app reopened at launch. (#425)
+- Chat explains a `/` command the running Claude Code doesn't know, such as a
+  skill added after the Agent started, instead of leaving the message waiting
+  with no reason, and its `/` menu leaves out skills marked
+  `user-invocable: false`, which Claude Code refuses as commands. A
+  `/compact` that Pi or Oh My Pi refuses with nothing to compact now says so,
+  and one still compacting no longer reads as not yet in the conversation.
+  (#425)
+- Context compacted previews skip Claude Code's fixed preamble, every
+  program's compaction summary and Pi's branch summaries show without their
+  Markdown marks, and VoiceOver reads only a compaction's preview lines. Inline
+  code is tinted, so it stands out in Chinese text too. (#425)
+- An expanded Declined, Interrupted or Stopped row no longer says "No output."
+  for a call that never ran. (#425)
+- Codex rows show a failed turn's API error message instead of its JSON, read
+  a patch aborted before it applied as Interrupted instead of Failed, also
+  when Codex 0.163 declines it in code mode without recording the patch, and
+  show an answer's note without its `user_note:` key. (#425)
+- Oh My Pi rows show a `write` as a written file with its text and line
+  counts, show `$` Python runs as notices, and no longer show the plan
+  hand-off to `xd://propose` as a created file. An edit of its plan file
+  reads by its `local://` name rather than the account's session path.
+  (#425)
+- Blocked cards appear for Claude Code's question review page and questions
+  with previews, which herdr reports as idle, with the question row reading
+  Waiting rather than "No result", and Claude Code's Read file
+  dialog gets its own card. After "The Agent hasn't responded yet." the
+  answers stay off on the same dialog, so a second tap can't send the key
+  again; Stop and the terminal still work. (#425)
+- A Claude Code question form that stops on a page Heeler can't read names the
+  next question rather than the one already answered, the folder-access option
+  says it lasts the session instead of saving a rule, and the folded card's
+  buttons stay on one line. (#425)
+- Generic cards for Codex lists show only the option labels, an Oh My Pi
+  panel's text shows without borders or private-use glyphs, an Oh My Pi
+  question's answers are off while a draft would take the keys, and a Codex
+  asynchronous answer confirms as soon as its question leaves the screen and
+  is marked on the question asked in the running turn, not on an earlier
+  turn's question with the same title. (#425)
+- A send that Codex holds names its "Implement this plan?" selector or a
+  message Stop put back in the input box, and Waiting for Conversation
+  explains that Codex reports a resumed conversation after its first prompt.
+  (#425)
+- Chat follows Claude Code's `/clear` and Pi's and Oh My Pi's `/new` or
+  `/resume` typed in the terminal within about ten seconds while the Agent
+  stays idle, and a steer cleared in the terminal no
+  longer stays under a newer turn. (#425)
+- While the Host is away or the conversation comes from the cache, the newest
+  turn no longer ticks "Working for" and running rows read Running when last
+  seen instead of spinning; the connecting banner says it shows saved
+  messages. (#425)
+- The Console stops looking for a hidden Agent's missing conversation after a
+  few tries, until the Agent's status or session changes, instead of searching
+  the Host every half minute. (#425)
+- A command Codex leaves running after a turn ends no longer unfolds that
+  turn when it finishes, below the answer; it joins the turn's folded steps.
+  (#425)
+- Chat stops reading an Agent's conversation once you leave it on iPhone,
+  instead of reading it every few seconds in the background until the app
+  relaunches. (#425)
+- Hosts no longer stay Paused after you return to Heeler while an overlay
+  network is still shutting down from the previous trip to the background.
+  Hosts reconnect right away. Hosts reached through that overlay network
+  say it is still shutting down and keep retrying until it has, instead of
+  waiting without a word. Heeler now closes its connections 15 seconds
+  after you leave it instead of 20, so they finish closing before iOS
+  takes back its background time. (#476)
+- Closing a connection through a Tailscale network no longer risks shutting
+  down an unrelated connection that reused its file descriptor. Tailscale
+  networks now run libtailscale 0.2.0 with Tailscale v1.104.1. (#463)
+- Gboard and other third-party keyboards no longer drop doubled letters
+  (`https` became `htps`) or leave the misspelled word behind when they
+  paste or autocorrect in Direct Input and shell terminals. (#461)
+- On iOS 18, Heeler no longer crashes while it shows an Agent's Changes as
+  file counts, as it does when the Checkout has changes but no added or
+  removed lines (only untracked files, for example). (#473)
+- Heeler no longer risks being terminated by iOS when it is still
+  disconnecting from its Hosts as its time in the background runs out.
+  (#473)
+
+## [0.1.14] - 2026-10-15
+
+### Added
+
+- Read and search Heeler's connection guides in English or Simplified Chinese
+  on the new documentation site, with navigation for overlay networks, Jump
+  Hosts, Host Routes, and Windows setup, and copy any guide as Markdown. (#442)
+- Group the Agents list By Workspace from its presentation menu. Collapse
+  Workspaces to focus on one project while keeping status counts visible;
+  the choice and collapsed Workspaces persist across launches. (refs #364)
+- Return to the Console from an Agent's More menu. Back to Console does
+  what swiping in from the left edge does, so the way back no longer
+  depends on knowing the gesture; the Agent keeps running on the Host. (#439)
+- Give a Host more than one route — its LAN address for home, say, and an
+  overlay network or Jump Host for everywhere else. Add Route in Edit Host;
+  Heeler tries every route each time it connects and keeps the first that
+  reaches the Host, starting routes over this device's own network a moment
+  ahead, so at home the LAN address wins without an overlay network ever
+  starting. Pairing adds every address the Pairing Code offers. A Host's key
+  is trusted once for all of its routes: another machine answering one of
+  its addresses is refused, and adding an overlay address no longer asks to
+  confirm the key again. (#437)
+- See which route a Host is connected through. Its detail page opens with
+  the connection's status and a Reconnect or Stop button, lists every route
+  with the one in use marked, and when no route reaches the Host shows why
+  each one failed. Edit Host lists routes as rows that each open their own
+  page, and a new Host starts from Add Route. Run Checks Again moves beside
+  the Preflight heading. (#438)
+- Reach a Host through Tailscale, ZeroTier, or EasyTier without turning on a
+  VPN. Add a network in Settings › Overlay Networks, then choose it under
+  Network when editing the Host. Heeler joins the network itself while it is
+  open, and only for its own connections. A network's screen shows this
+  device's addresses and node ID (copyable, for authorizing on ZeroTier) and
+  its peers; Tailscale networks can sign out, ZeroTier networks can orbit
+  moons or use a custom planet of their own (so networks on ZeroTier Central
+  and on self-hosted roots connect side by side), and EasyTier can use a
+  fixed address or take its networks from an EasyTier config server (web
+  console). Several EasyTier networks, manual or from config servers, run
+  side by side, even on the same subnet; a config server may assign up to
+  eight, listed on its network's screen, and a Host reaches the one its
+  address or name is on. A config server must offer EasyTier's encrypted
+  connection unless Require Encryption is turned off for it; the form warns
+  about clear-text and unverified transports. ZeroTier networks that give
+  this device the same address stay apart too, each Host reaching the peer
+  on its own network. A Host address that is not on the tailnet, or that its
+  ZeroTier network has no route to, fails at once instead of waiting for the
+  connection timeout. (#426)
+- Pick a Host from a Tailscale or EasyTier network instead of typing its
+  address: Choose from Tailnet… in the Host form connects the network if
+  needed and lists its peers to search, filling in the peer's IP address
+  (or Tailscale machine name) and a blank Host name; the form then names
+  the chosen machine and the list marks it. Add beside a machine on a
+  network's screen in Settings adds it as a Host too, and machines that
+  already are a Host say so. (#426)
+- A ZeroTier network's screen has Diagnostics: the network's status,
+  addresses, routes, roots and members with their paths, and recent events,
+  with Copy All for reporting a problem. Its peers are listed as members and
+  roots. A device awaiting authorization shows as Waiting and keeps trying
+  until an admin approves it. (#426)
+- Stop waiting for a network that is slow to connect: Connect on a
+  network's screen, Choose from Tailnet…, a Host's checks, and a Host the
+  Console is still connecting each offer Cancel (or Stop Connecting), which
+  returns at once without a timeout error. A ZeroTier network stays joined
+  so a later authorization still applies; a stopped Host stays paused until
+  you reconnect it. (#426)
+
+### Changed
+
+- The solving orb on working Agents draws at 30 frames per second and pauses while it is off screen or Heeler is in the background, so a working Agent keeps the main thread far less busy and the phone cooler; the animation looks the same. (#436)
+- Settings › About › Acknowledgements shows each component's source and, where recorded, its version, and a distributed build names the commit it was made from, with a link to that source. (#426)
+- Redesign Settings › Overlay Networks: each network has a switch to connect or disconnect it (Cancel while it connects, Sign In before its first login), a status card with this device's address to copy, and its machines with Add or Host beside each, searchable. Adding a Tailscale network picks the kind from cards, keeps the coordination server and auth key under Advanced, and goes straight to browser sign-in (or connects with its auth key); Edit, Sign Out and Delete sit in the network's menu. A Tailscale device awaiting admin approval shows Waiting for approval and joins once approved, and the Host form puts Network first once an overlay network exists. ZeroTier and EasyTier networks connect as soon as they are added, keep moons, custom planets, fixed addresses and encryption under Advanced, and show the ZeroTier node ID or EasyTier machine ID to authorize on the status card (ZeroTier creates its node ID on the first connect, not when its form opens, so an unused one no longer sits in the network list); a ZeroTier network waiting for authorization offers Open ZeroTier Central, its roots move to Diagnostics, and an EasyTier config server's networks each list their address and peers, or why they don't run. (#426)
+
+### Fixed
+
+- Removing a Host now ends its Live Activity and forgets its Live Activity
+  setting, and Heeler no longer keeps retrying Live Activity updates for the
+  removed Host. (#444)
+- Removing a connected Host now also stops its notifications to this
+  device: Heeler first takes this device off the Host's notification list,
+  then deletes the Host's Notification Key along with its saved password. If
+  the Host isn't connected, the confirmation says so and suggests connecting
+  first; a Host removed without being reached may keep sending this device
+  generic "Agent update" notifications. (#445)
+- When a Host's Heeler plugin is turned off, the steps on the Host's page
+  now always end with the command that turns it back on: after updating an
+  outdated plugin, which herdr 0.9.4 leaves off, and after removing a copy
+  left under the plugin's former name. That command names the Host's herdr
+  session, so it works when the default session isn't running.
+  Notification settings now say the plugin is missing or turned off and
+  point to the Host's page. (#458)
+- Close Agent and Close Terminal now ask from the More button you tapped,
+  instead of a bubble floating in the middle of the terminal. (#440)
+- New Agent with long Arguments on a macOS Host running herdr 0.9.4 now
+  waits for the new shell to take the launch command instead of failing at
+  once and removing what it created. If the shell never takes it, as with
+  dash, New Agent asks you to shorten the Arguments. (#458)
+- When attaching to an Agent or terminal on a macOS or Linux Host fails
+  because herdr exits, the message now quotes herdr's own error, such as an
+  older herdr earlier on the SSH PATH losing its connection to the server,
+  instead of only an exit status. (#443)
+- On a macOS or Linux Host with herdr 0.9.4, opening an Agent or a Shell
+  Terminal over a slow connection no longer types stray characters into
+  the Agent or shell: Heeler no longer answers the terminal query herdr
+  sends when it attaches, whose late answer herdr passed on as typing.
+  (#458)
+- Start Tailscale browser authorization with one Sign In button and reconnect automatically after returning from the browser. (#426)
+- Show Connected and remove the sign-in prompt when Tailscale browser authorization completes, without requiring another Connect. (#426)
+- Open a Host's connection checks after adding it from an overlay network's peer list, so its SSH host key can be trusted on the first connection. (#426)
+- Agent cards keep a Host's herdr sidebar fields and Agent order when its
+  herdr sidebar settings use the letta agent, the machine field, field
+  rules, or a UTF-8 byte-order mark, instead of falling back to herdr's
+  defaults. Update the Heeler plugin to 0.6.1 on each Host. Sync from
+  plugin no longer blames herdr when the plugin can't read a Host's
+  settings. (#458)
+- Type Korean straight into the terminal with the iOS Korean keyboard:
+  syllables now compose as typed instead of arriving as repeated or loose
+  jamo ("한글 지원", not "한한한글글글글지지지원"), with the software keyboard
+  and a hardware keyboard alike, including after Backspace. (#441)
+- Removing a Worktree that has checked-out submodules now says that the
+  submodules block it, instead of blaming modified or untracked files.
+  Show Changes stays, and Copy Command hands you the herdr command that
+  forces the removal. While herdr is still loading restored Worktrees
+  after a restart, the message gives herdr's own reason instead of
+  saying a worktree change is already underway. (#458)
+
+## [0.1.13] - 2026-10-07
+
+### Added
+
+- Autocorrect and spell checking in native Composer drafts. Direct Input and
+  shell terminals keep them off. (#407)
+- Manual SSH connections to native Windows herdr 0.9.3 or newer, including
+  default and named sessions, live Agent and shell terminals, and Windows
+  directory navigation. Windows uses herdr's official API bridge and terminal
+  controller. Pairing, Changes, Skills, file uploads, and notification
+  registration remain unavailable on Windows. (#400)
+- Long-press an Agent row to close its pane, tab, or workspace, with the same
+  confirmation as the swipe action. (#408)
+- Agent and terminal screens on iPhone have floating glass buttons for Back,
+  the Workspace's terminals, and an Agent's Changes. They start folded to a
+  single button and stay shown once the user opens them. Swiping back from
+  either follows the finger like any other screen. (#409)
+- Duplicate a Host from its long-press menu in Hosts. The add form opens
+  with every field filled in from that Host, including its password, named
+  the way Finder names copies ("laya-train copy", then "laya-train copy 2"),
+  and saving adds a new Host that goes through onboarding like any other.
+  (#413)
+- Settings › About has a Star on GitHub row, replacing the plain GitHub
+  link. Version shows an icon, and external links read like the other rows
+  with a trailing arrow instead of blue text. (#421)
+- A Setup Guide walks through preparing a macOS, Linux, or Windows machine
+  and adding it as a Host, with copyable pairing commands. Open it from the
+  empty Agents and Hosts screens, where it ends in Scan to Pair or Add
+  Manually, or from Settings › About. (#421)
+- Host details show the installed Heeler plugin version. When the plugin is
+  missing, disabled, installed under its old name, or older than the version
+  this app ships with, the version carries an icon that opens how to fix it,
+  with copyable commands unless the plugin is linked from a local checkout.
+  Notification and Agent List Fields settings say which features a Host's
+  older plugin lacks, such as notification session isolation before plugin
+  0.6.0. (#422)
+- Agent and terminal screens beside the iPad sidebar have the floating glass
+  buttons for the Workspace's terminals and an Agent's Changes, folding
+  like on iPhone. They leave out Back, since the list is already beside
+  them. (#421)
+- Other apps can open an Agent in Heeler with a
+  `heeler://agent?host=<address or name>&session=<name>&pane=<pane id>`
+  link. Heeler looks for the saved Host with that address, or else that
+  name, on that herdr session; leaving out `session` means the default one.
+  Without a pane, or when no single Host matches, the link opens the
+  Console. (#423)
+
+### Fixed
+
+- Fix Agent terminal connections failing when an older system herdr shadows the user's updated installation. (#404)
+- Opening an Agent from the iPhone Agent list no longer shows the input bar
+  a tab bar's height too high before it drops to the bottom of the screen.
+  (#406)
+
+- Preserve literal absolute Unix API endpoints without a HOME probe, and keep
+  Windows API and terminal connections on the selected session when SSH
+  inherits legacy socket overrides. (#400)
+- Large diffs in Changes no longer wait for the Git timeout when the SSH
+  connection briefly cannot send. (#402)
+- After you trust a new Host's key in its detail view, the Host now
+  connects as soon as the checks pass instead of staying failed until you
+  tap Reconnect. (#413)
+- Hosts that reach the same remote user no longer mix up their notification
+  registrations. A Host's Notifications toggle shows only its own
+  registration, and turning notifications off on one Host no longer stops
+  another. Hosts on different herdr sessions get notifications and Live
+  Activity updates only from their own session; Hosts on the same session
+  share one registration, held by whichever turned notifications on last.
+  Update the Heeler plugin to 0.6.0 on each Host: with an older plugin,
+  Hosts on different sessions can still receive each other's notifications,
+  which open the wrong pane, and one event can arrive twice. (#416)
+- In a narrow iPad window, Agent and terminal screens now show the same
+  floating Back button as on iPhone. The edge swipe was the only way back to
+  the list there, and the window's resize edge took it. (#420)
+- A shell terminal stays open when an iPad window is resized between
+  narrow and wide. It used to fail with "This terminal is already open in
+  another window", and Try Again kept failing until Heeler restarted.
+  (#420)
+- Buttons on terminal status cards (Couldn't Open Terminal, Session Ended)
+  now use the terminal theme's foreground and background colors instead of
+  its blue, which in light-accent themes such as the default Vesper left
+  white labels on pale lavender. (#420)
+- Widening an iPad window while an Agent or terminal is open no longer
+  brings back the tab bar beside the sidebar, and narrowing it back to a
+  list no longer leaves the list without its tab bar. (#420)
+- Diffs in Changes open Unified by default. On an 11-inch iPad beside the
+  sidebar, the Side by Side / Unified control showed neither choice and
+  could not be switched; it now works there and in portrait, and lost the
+  extra rings around it. A window too narrow for Side by Side hides it.
+  (#421)
+
+## [0.1.12] - 2026-10-02
+
+### Added
+
+- Changes shows what is uncommitted in the Checkout an Agent is working in.
+  Open it from the Agent's More menu, or tap the branch or totals on the
+  status line above the input; Back or a swipe to the right returns to the
+  Agent. Files are grouped as in VS Code's Source Control
+  (Conflicts, Staged, Changes, Untracked), one line each with its folder,
+  line counts, and status letter. Tap a file for its diff, with changed
+  words highlighted and side by side on iPad. Git runs on the Host over SSH
+  without hooks, file-system monitors, or index writes. (#382)
+- The Agents list and Agent detail's status line show each Checkout's line
+  totals, such as +12 −7, or Tide's file counts, such as +1 !2 ?3, when no
+  line changed. The status line also shows the branch and its upstream
+  distance as Tide does, as main ⇣1 ⇡2. Both refresh when the Agent stops
+  working or its Host reconnects. (#382)
+
+### Changed
+
+- The Dynamic Island says what its numbers mean: each status is a glyph with
+  its count, an exclamation mark for Blocked, a check mark for Done, and an
+  open ring for Working. The most urgent status sits left of the camera and
+  the others sit right, so one status no longer shows the same number on both
+  sides. Expanded, the island leads with that status spelled out and marks
+  each Agent with the same glyph. (#398)
+- An Agent's row in the Agents list ends its second line with the Host name
+  rather than its last, making room for the Checkout's line totals there.
+  (#382)
+
+### Fixed
+
+- On iPad, a short Agents list shown over the detail no longer starts with
+  its first row under the search field. (#397)
+
+## [0.1.11] - 2026-09-28
+
+### Added
+
+- The Console has Agents, Terminals, Hosts, and Settings tabs in a bottom
+  tab bar, and reopens the list tab last shown. Hosts and Settings replace
+  the toolbar's Hosts and Settings buttons, and a Host opened from a Host
+  problem in another tab goes back to that tab. An iPad beside its sidebar
+  has no tab bar: the sidebar switches between Agents and Terminals from a
+  menu on its title, and opens Hosts and Settings as sheets from buttons at
+  its foot.
+  Terminals lists every Host's shell panes as one collapsible card per
+  Workspace, By Workspace or By Host, sharing the Agents tab's Host filter.
+  A shell in a named tab is listed by that name, and shells sharing a card
+  show their tab beside the path. Each card ends in a New Terminal row that
+  opens a shell tab in that Workspace, and the toolbar's New Terminal picks
+  a Host, an existing or new Workspace, and an optional tab name. Swipe a
+  terminal to close it after confirming, or long-press it to open another in
+  its Workspace or copy its path. Pull the Terminals list down to search it
+  by Host, Workspace, tab, title, or directory. (#316; PR #377)
+- A Shell Terminal's input row ends in a keyboard button, as the Agent
+  switcher does: it hides the keyboard, the Keys keyboard included, and
+  brings the system keyboard back. (PR #381)
+
+### Changed
+
+- A Host's connection state reads at a glance: Host headers in the Agents
+  and Terminals tabs lead with a server glyph instead of a line of text, and
+  a badge on its corner marks the state: green once connected, an open ring
+  while connecting, a spinning orange arc while reconnecting, orange when
+  out of sync, and red once the Host stops on a failure, which also dims its
+  name. The disclosure chevron moves to the trailing edge, and an expanded
+  Host in the Agents tab states its condition as the Terminals tab does.
+  (#316; PR #377)
+- By Host, in the Agents and Terminals presentation menus, shows an
+  indented list instead of the server glyph Hosts uses. (PR #381)
+- A Host that is reconnecting or cannot connect no longer expands: tapping
+  it opens a sheet with the failure, a Retry button, and Edit for its
+  settings. In the flat Agents list and the By Workspace terminals, Hosts
+  with a problem gather atop the list: one Host as a short line, several as
+  a summary that counts them by state and opens them in a sheet, where each
+  failing Host shows its failure and Retry Now. (#316; PR #377)
+- The Hosts list groups Hosts by what they need, each group collapsible:
+  Can't Connect first, naming each problem beside a refresh button that
+  retries, then Hosts still trying, then connected ones with their latency.
+  (#316; PR #377)
+- On iPad, Agents and Terminals set their list beside the terminal, each
+  keeping its own selection and sidebar; in portrait a pick returns to the
+  terminal alone, and swiping in from the terminal's left edge brings the
+  list back out instead of closing the terminal. The sidebar's buttons
+  stand bare on it, with New and Hide Sidebar beside its title even in the
+  narrowest window, its list menus sit at its foot, and its search field,
+  as on an iPhone, stays out of sight until a list is pulled down. The terminal
+  reaches the top of the window, and the status bar takes its colors,
+  except beside a sidebar of the other appearance, where a band in the
+  app's colors keeps it legible. Sidebar rows mark the
+  selection and the keyboard focus with a quiet rounded fill and ring
+  instead of a blue band, and long-pressing one lifts a card of it. An
+  Agent opened from a notification or from a shell always shows on the
+  Agents tab. ⌘N opens New Terminal on the Terminals tab, and the menu names
+  each command for the tab on screen. A shell's loading, failure, and closed
+  states draw on the terminal's own background. (PR #381)
+- On iPad, Hosts and Settings open as centered sheets with Done, a Host
+  problem opens its Host there, and a Host's status sheets, New Terminal,
+  and New Agent open as centered forms sized to their content, with Done:
+  New Agent grows to show its whole form, up to the window's height,
+  instead of scrolling inside a fixed form. The buttons on an empty detail
+  (Show Agents, New Agent, New Terminal) are full size and one width,
+  instead of the small ones sized for a phone. (PR #381)
+- The Hosts list marks a connected Host that cannot sync, and a Host with
+  Retry opens like every other row. A Host header shows a sync issue ahead
+  of loading, and the workspace drawer names shells as the Terminals list
+  does. (PR #381)
+- Agents search hides under the list's title until you pull the list down,
+  and matches an Agent's Host and kind too. While searching, a Host without
+  a match leaves the list even when it has a connection problem, and a
+  collapsed Host opens to show its matches. (#316; PR #377)
+
+### Fixed
+
+- Pairing names Tailscale SSH when it answers the Pairing Code's port
+  instead of OpenSSH, and points at `ssh_port` in the plugin's `pair.json`.
+  It used to wait out a `check` policy and report that the Host did not
+  answer, or run the enrollment command under an `accept` policy and blame a
+  network hiccup; it now stops before authenticating. A pairing command
+  that ends without answering is reported as such rather than as a network
+  hiccup. (#358; PR #376)
+- Rotating a Max iPhone or resizing an iPad window no longer rebuilds an
+  open sheet such as Start Agent, which dropped what was typed in it and
+  any page pushed inside it. (PR #381)
+- In a narrow iPad window, an Agent's terminal and a shell start below the
+  window's close and resize controls instead of under them. (PR #381)
+
+## [0.1.10] - 2026-09-23
+
+### Added
+
+- Swipe an Agent row left to close it or right to pin it; a full swipe
+  acts at once. Closing always asks first and takes only the Agent's
+  pane when its tab holds others. (#366; PR #374)
+- The New Agent sheet can create a Workspace from a name alone. A
+  name-only launch defaults the directory to the Host's home and the
+  workspace label is now a field on the form; a browsed directory still
+  overrides it. (#362)
+- The Agent terminal shows the session's model, prompt size (as a share of
+  the model's context window, `11.0%`, once omp on the Host has named it),
+  and spend in a strip above the terminal. These are the figures the Agent's own status line
+  prints, but a phone-width terminal runs out of room for them and drops the
+  last ones first. Heeler reads them from the Agent's session file on the Host,
+  following only what the file gained since the last look, and the strip wears
+  the terminal's theme. Only omp reports such a file today; a figure that
+  cannot be read is left out rather than shown as a placeholder. When omp's
+  own `tok/s` readout is on (`composer.tokenRate`), the strip shows the last
+  turn's generation rate too. (#325)
+- Pairing Codes can advertise a non-default SSH port via `pair.json`
+  (`ssh_port`) in the plugin config directory, so OpenSSH can share a Host
+  with Tailscale SSH on port 22. A `pair.json` the plugin cannot honor is
+  named in the pair checklist instead of quietly reverting to 22, and a
+  checked tailnet address on a Host that is serving Tailscale SSH is called
+  out there too — before the QR appears, rather than as a failure on the
+  phone. (#355)
+
+### Fixed
+
+- New Agent tabs take the agent's name. `tab.create` now carries it as
+  the tab's label, and after a workspace or worktree launch the fresh
+  tab is renamed once the agent is running, so the tab bar shows names
+  instead of herdr's automatic "Tab N". An optional Tab Name field on
+  the form overrides that default with free text, since herdr limits
+  agent names to a lowercase slug but not tab labels. (#362)
+- Pairing no longer defaults to a Docker bridge address when the Host's
+  primary interface has no suitable private or VPN address. Docker bridge
+  and veth addresses remain available for manual selection at the end of
+  the checklist, without being pre-checked. Normal LAN bridges keep their
+  existing selection behavior. (PR #357, refs #356)
+- A message sent to an Agent the app had just launched no longer fails with
+  "herdr rejected the message: agent wX:pY is not an active named agent".
+  herdr 0.8.0+ answers `agent.start` while the pane's agent is still booting,
+  and the Console's post-start wait only checks that the Agent's row exists —
+  so the first prompt typed into the fresh Agent's tab could beat the agent's
+  registration on the Host, and herdr refused the send even though the pane
+  id was correct; leaving the Agent and returning was what made sending work.
+  The composer now treats that rejection as the launch race it is and waits
+  it out at a fixed pace inside the same bounded budget the transport already
+  uses for a fresh pane's booting shell, still surfacing herdr's refusal once
+  the budget is spent and never retrying a genuinely absent Agent
+  (`agent_not_found`). (#368)
+- A message sent to an Agent the app had just launched no longer fails with
+  "The Host is not connected." Launching an Agent — a new Workspace's Agent in
+  particular — makes the Console subscribe to that pane's status events, and
+  when the Host's connection has gone quiet or degraded during the launch,
+  that subscription swap silently replaces the SSH transport. The Console kept
+  reporting the Host as connected while every Host-scoped request — the
+  composer's send included — was refused for the seconds the replacement dial
+  took, and the first message typed into the fresh Agent's tab died inside
+  that window; leaving the Agent and returning was what made sending work.
+  Host-scoped requests now wait for the replacement transport instead of
+  failing against a gap the connection status never announced, and still fail
+  at once with the real cause when the session is suspended, stopped on an
+  action-required failure, or visibly reconnecting. A caller that reaches the
+  degraded transport before the session notices also gets one redial-and-retry
+  instead of a phantom "The Host is not connected." — the case the launch
+  window kept producing. (#368)
+- Manually adding a Host (or finishing Scan to Pair) no longer loses the
+  "Trust this Host?" alert. Navigation into onboarding waits until the add
+  sheet has finished dismissing, so preflight's TOFU prompt is not dropped
+  mid-transition. (#359)
+- Typing into an Agent with Direct Input no longer sends a word twice. The
+  iOS keyboard no longer offers autocorrect or QuickType suggestions there or
+  in Composer, so pressing Space cannot add a suggested word after the letters
+  already typed. Chinese and other input methods keep their candidate bar.
+  (PR #349)
+
+## [0.1.9] - 2026-09-19
+
+### Added
+
+- Browse every terminal in the Workspace from a drawer docked to the edge of
+  Agent detail. The list groups by Host and Workspace and shows Tab titles,
+  paths, and which panes run Agents. A terminal you have opened keeps its
+  connection and screen for five idle minutes, up to five per Host; the least
+  recently viewed idle one gives way when a sixth is needed. New Terminal
+  opens a fresh shell tab in the Workspace. Output stays readable under the
+  drawer handle and the message-jump tabs. (#333)
+
+- Choose an existing Workspace or New Workspace from the same dropdown in
+  New Agent. New Workspace opens a remote directory browser. The latest directory stays at the
+  bottom of the dropdown, with its name and full path shown when selected. (PR #305)
+- Hosts can authenticate with a device-generated RSA Key using RSA-SHA2-512,
+  including connections through a Jump Host. The private key remains in the
+  Keychain and the public key can be copied from Host settings. (PR #347)
+
+### Changed
+
+- The message-jump buttons dock flush against the terminal's edge as a tab,
+  matching the Workspace drawer handle. Long-press either to slide it along
+  the edge; each stays where you leave it. (#333)
+- The Shell Terminal drops its title bar so output runs up to the status bar.
+  Back and Close Terminal moved into the More menu on its input row, which now
+  stays visible while the keyboard is down. The row's Insert New Line button
+  is gone; Shift+Enter on the Keys keyboard sends the same line break. (#333)
+- The keyboard follows you between Agent detail and a Shell Terminal: up or
+  down, it is the same on the other side, and it stays on screen through the
+  switch instead of dropping and rising again. The terminal's Text/Keys row
+  sits above it from the first frame, and the two screens dissolve into each
+  other instead of cutting. (#333)
+- Make the remote directory browser more compact, with full-row folder navigation,
+  native filtering, empty states, and retry for failed navigation. (PR #305)
+
+### Fixed
+
+- Connecting to a Host no longer fails intermittently during post-quantum key
+  exchange. Roughly one handshake in 256 was rejected by a defect in the SSH
+  library, and about twice as often for a Host behind a Jump Host; the app now
+  redials once. (#332)
+- A saved Host with an authentication method this build does not understand is
+  skipped without making the rest of the Host catalog unreadable. (PR #347)
+- Show the directory browser on the first New Workspace tap. (PR #305)
+- Viewing a Done Agent marks it seen on its Host and refreshes Console and
+  Live Activity status, including other Agents in the same Tab. (#314)
+
+## [0.1.8] - 2026-09-13
+
+### Added
+
+- iPad is a first-class target again. App Store builds include iPhone and
+  iPad, iPad supports all four interface orientations, and `make sim-ipad` /
+  `make test-ipad` run against the iPad simulator. (PR #323)
+- Drag text and images into the Composer on iPad. Send stays disabled, with
+  a visible "Waiting for image…" hint next to the button, until dropped
+  images finish staging. (PR #323)
+- Hardware keyboard shortcuts: ⌘1–9 selects visible Agents, ⌘[ / ⌘] switches
+  Agents, ⌘F searches, ⌘N starts an Agent, ⌘, opens Settings, ⌘⇧H opens Hosts,
+  ⌘E switches Direct Input / Composer, ⌘Return sends the focused Composer draft,
+  and ⌘W closes the Agent view. (PR #323)
+- On iPad, Heeler opens in more than one window and resizes freely under Stage
+  Manager. Long-press an Agent and choose Open in New Window, or drag its row
+  out; each window restores its own Agent after a relaunch. Windows on Agents
+  of different Hosts are all live at once. A Host has one live terminal, so
+  windows on the same Host hand it to the one you last touched or typed in,
+  or to a window you just opened; the others show Live in Another Window
+  with Take Over Here (not while that Host's Shell Terminal is open), and
+  returning to the app leaves it where it was. A notification for an Agent
+  already on screen brings that window forward instead of opening another,
+  and a live window resize sends the Host one terminal resize once the
+  window settles. (PR #323)
+
+### Changed
+
+- Direct Input's More button matches the arrow key size and shortcut spacing,
+  with equal padding at the strip's outer edges. (PR #323)
+- The Terminal keyboard fills its dock width on iPhone and iPad without
+  increasing its height. Character keys share one width across staggered
+  rows, with wider Shift, Backspace, and Space keys. Agent and Skills
+  keyboard wells remain centered on wide screens. (PR #323)
+- On iPad the Composer's tools dock, Direct Input's Keys dock, and the
+  Shell terminal's Keys dock no longer leave the system keyboard's floating
+  candidate and prediction bar over the dock. (PR #323)
+- iPad adapts its two-column Console to landscape and portrait, with a Show Agents
+  action in empty detail, form sheets for Hosts, Settings, New Agent, Skills,
+  Rename, Snippets, and Worktree, plus Attach Links popovers. (PR #323)
+
+### Fixed
+
+- The pairing popup keeps startup errors on screen until a keypress, instead
+  of exiting immediately and closing the Herdr pane. Missing SSH host keys
+  now tell the user to enable Remote Login or run `sudo ssh-keygen -A`.
+  (#319)
+- Agent List Fields no longer refuses every edit after a build with a
+  different field set saved on the same device: field names this build does
+  not know are dropped on load instead of making the whole saved catalog
+  unreadable. When the saved fields truly cannot be read, both Agent List
+  Fields screens say so before any edit, keep the fields read-only, and offer
+  Reset Saved Fields. (#320; PR #321)
+
+## [0.1.7] - 2026-09-12
+
+### Added
+
+- Muse appears in Start Agent when the Host has `muse` on PATH. Notifications
+  and Live Activities name it Muse, and the Heeler plugin accepts `muse`
+  sidebar row overrides. (#297)
+- Direct Input's shortcut row gains a Paste key after ⇧Enter, so pasting into
+  an Agent no longer needs a hardware keyboard. The text goes through the
+  same paste review as ⌘V. (#307)
+- The Agents list has a search field. Typing filters Agents by working
+  directory or title text, combines with the Host filter, and hides empty
+  Host sections in grouped mode only while their Host is nominal; a
+  reconnecting or failed Host keeps its section. (#292)
+- In Compose, swipe between Agent controls and a full Terminal keyboard with
+  letters, numbers, symbols, Ctrl/Alt/Shift, and F1–F12. The same keyboard is
+  available in Open Terminal's Keys mode. Both pages match the iOS keyboard
+  height and preserve the Composer draft. Tap a modifier to apply it to the
+  next key; tap it again to cancel. (#270; PR #302)
+- Skills and Snippets are available in Direct Input as well as Compose.
+  Selecting one inserts it into the active input without pressing Enter.
+  (PR #302)
+- Hold Backspace for 0.3 seconds to keep deleting; release to stop. This works
+  in the Agent controls, Direct Input shortcut row, and full Terminal keyboard.
+  (PR #302)
+
+### Changed
+
+- Custom keyboards now use Ghostty's key encoding, which distinguishes more
+  Ctrl/Shift combinations and supports enhanced keyboard reporting. Layouts
+  and controls stay the same. (PR #298)
+- Terminal character keys use larger labels and uppercase letter keycaps.
+  Function key labels keep their existing size. (PR #302)
+- Direct Input's tools dock opens the full Terminal keyboard without the
+  Agent controls page, since those keys are already in the toolbar. (PR #302)
+- Agent, Terminal, and Direct Input toolbar keys use a soft gray highlight
+  and light haptic feedback when tapped. Agent controls put Backspace at the
+  top right and Shift+Tab at the bottom left. The Direct Input shortcut row
+  no longer duplicates the Terminal keyboard's Ctrl/Alt buttons. (PR #302)
+### Fixed
+
+- Switching Agents keeps the Terminal tools keyboard selected instead of opening
+  the iOS keyboard over the controls. Returning from the Agent list no longer
+  restores stale keyboard focus, and keyboard height tracking resumes correctly.
+  (PR #302)
+- Backspace keeps its full touch area while pressed and tolerates small finger
+  movements, so holding near an edge no longer cancels deletion. (PR #302)
+- Backspace highlights and repeats while held, even when surrounding gestures
+  delay button events until release. This applies to Agent controls, the
+  Direct Input shortcut row, and the Terminal keyboard. (PR #302)
+- Modifier and keyboard layer keys keep their selection color while pressed,
+  without flashing gray or shrinking. (PR #302)
+- Fixed missed taps on terminal controls near the left edge, where the
+  swipe-back gesture could intercept them. (PR #302)
+- New Agent now discovers agents installed through mise. The discovery PATH
+  includes mise's shims directory, resolved from `MISE_DATA_DIR` or
+  `XDG_DATA_HOME` when either reaches the non-interactive SSH environment,
+  otherwise `~/.local/share/mise/shims`. (#293)
+- The Lock Screen Live Activity shows three Agents with three-row Agent List
+  Fields instead of two before "+N more". The row budget overestimated card
+  height and its test measured only frame minimums, not the rendered text.
+  Four three-row cards exceed ActivityKit's 160 pt limit, so four rows remain
+  only for two-row layouts. (#281)
+- Console rows show a standard home directory as `~` again: an Agent launched
+  in `/Users/aliefe/Code/bitbucket/opinnate-python` prints
+  `~/Code/bitbucket/opinnate-python`. Only the SSH account's own `/root`,
+  `/Users/<user>`, and `/home/<user>` homes are shortened, so a path that
+  merely shares a prefix with a longer account name is left alone. (#311)
+
+## [0.1.6] - 2026-09-09
+
+### Added
+
+- Agent cards and the keyboard switcher use herdr's sidebar fields and Agent
+  order. Customize each Host's card layout in Settings > Agent List Fields:
+  add, style, move, or remove herdr, Heeler, and plugin fields across up to
+  three rows, with a Console preview and automatic saving. Sync from plugin
+  refreshes the first two rows; the third defaults to `directory` and keeps
+  your edits when syncing. (#277, #281)
+
+- Live Activities follow each Host's Agent List Fields, including directory
+  and plugin fields, on the Lock Screen and expanded Dynamic Island. Update
+  the Heeler plugin on each Host to use these fields in background updates.
+  (#281)
+
+### Changed
+
+- Relicensed the Heeler suite from AGPL-3.0 to Apache License 2.0. (#282)
+
+### Fixed
+
+- Hiding Composer keeps terminal links available through a floating link button
+  above the latency indicator. It matches the scroll controls, opens the same
+  link list, and does not reduce the terminal's height. (PR #284)
+
+- Secondary field styles now render correctly in Agent cards and previews. (#281)
+
+- Agent List Fields groups each Host's controls in one card, wraps field
+  chips, and uses the Console card for its preview, including the status
+  badge and Host name. (#281)
+- Connecting to a Host whose login shell is nushell or another non-POSIX shell
+  no longer fails with "The remote home directory could not be resolved". The
+  home probe now runs under POSIX sh, matching the other setup probes. (#275;
+  PR #276)
+
+## [0.1.5] - 2026-09-04
+
+### Added
+
+- Agent detail now has up/down buttons for jumping between your messages and
+  returning to the latest output. You can use them while the Agent is working,
+  and manual scrolling stops a jump. (#268; PR #272)
+
+### Fixed
+
+- Pasting text with Windows-style line breaks now opens the paste review sheet
+  instead of submitting each line separately. (#268)
+
+- Terminal layout now updates immediately when the keyboard cannot open. (#263)
+
+- New Agent now finds Agent CLIs installed with Bun, Cargo, Homebrew, or
+  Linuxbrew, as well as standard user-local installs. (#254)
+
+## [0.1.4] - 2026-09-01
+
+### Changed
+
+- Agent alerts consistently identify Agents by workspace plus friendly kind.
+  Live Activities use compact aligned rows with a colored status dot beside the
+  workspace and the friendly kind underneath, without terminal-title,
+  custom-name, workdir, or special Blocked-row background noise. (#260)
+
+- Agent cards consistently lead with the herdr workspace or Agent identity,
+  followed by the launch directory and a shared Agent-type and Host line;
+  terminal-generated titles and TUI metadata no longer compete with that
+  hierarchy. (#259)
+
+- When no size has been saved, Terminal Text Size now defaults to 8 pt instead
+  of 14 pt. Existing saved sizes do not change. (#256; PR #257)
+
+### Added
+
+- HeelerSSH connections negotiate post-quantum hybrid key exchange
+  (`mlkem768x25519-sha256`) against servers that offer it, via a libssh2
+  snapshot that carries upstream ML-KEM support; servers without it keep
+  using `curve25519-sha256`. (#261)
+
+- Agent detail now offers Direct Input, which hides the Composer and routes iOS
+  keyboard input directly to the live Attach PTY. A persistent row above the
+  Agent switcher provides Esc, Tab, Shift-Tab, arrow keys, Backspace,
+  Shift-Enter, and Enter; keyboard show/hide controls remain in the switcher.
+  Composer remains the default. Switching modes preserves the draft and keeps
+  a visible iOS keyboard in place. (#251; PR #253)
+
+### Fixed
+
+- Attach terminals begin restoring as soon as a reconnected Host's Transport
+  is ready, without waiting for event subscription and snapshot recovery. (#264; PR #265)
+
+## [0.1.3] - 2026-08-28
+
+### Changed
+
+- Live Activity Lock Screen uses system semantic colors and shares the Console
+  status palette; it shows up to four Agents in a dense hierarchy, stale
+  updates retain an out-of-date caption, and each visible Agent opens its
+  detail while the surrounding activity opens the Console. An iOS 27
+  ActivityKit regression can still force the Dark appearance and prevent an
+  existing activity from refreshing after a system appearance change. (#247)
+
+### Added
+
+- Console can switch between the flat status-sorted Agent list and a by-Host
+  grouped list with collapsible sections; collapsed Hosts show Live
+  Activity-style Blocked, Working, and Done count pills, and both the
+  presentation choice and per-Host collapse state persist across launches.
+  (#245)
+
+## [0.1.2] - 2026-08-26
+
+### Added
+
+- Cursor (2.4+) Agents get a Skills catalogue, probed from `.cursor/skills`
+  and `.agents/skills` at the project root and home.
+
+- Skills catalogues for thirteen more kinds, each probing its CLI's
+  documented directories — Antigravity, Cline, GitHub Copilot CLI, Devin
+  CLI, Droid, Grok Build, Hermes Agent, Kilo Code, Kimi CLI, OMP, Kiro CLI,
+  Qoder CLI, Qwen Code; Gemini CLI, Amp, Mastra Code, and Maki stay out by
+  design.
+
+- Agent detail shows the Host's latest SSH API latency next to Agent status,
+  on a status row that now follows the terminal theme's luminance. (#236)
+
+- The Composer suggests discovered Skills inline while an invocation prefix
+  is typed, and the More menu gains a searchable Skill picker — both insert
+  the command into the draft without sending. (#234)
+
+- Open Terminal in Agent detail's More menu: an interactive shell in the
+  Agent's launch directory, one reused tab per Workspace, an IME-safe fixed
+  input row, Back for desktop handoff, Close Terminal to reclaim the
+  tab. (#231)
+
+- New Agent can start in a new Workspace at a remote directory, with an
+  optional label, even when the Host reports none. (#230)
+
+- Console cards mark linked worktrees, whose repository, branch, and
+  checkout path show in Agent detail alongside a confirmed remove that keeps
+  the local branch. (#99)
+
+### Changed
+
+- Hosts get a distinct Connecting state, separate from automatic
+  Reconnecting, a paused connection, and loading Agents on a live events
+  path. (#155)
+
+- Failures show a short summary, optional detail, and a recovery suggestion
+  only when the error supports one. (#163)
+
+- GhosttyTerminal 1.3.1 → 1.4.0 (Ghostty v1.3.1): surfaces survive window
+  detaches, draws pace on a display link, and keyboard input rides the
+  upstream key encoder with better IME handling. (#242)
+
+### Fixed
+
+- Covering a terminal with a presentation no longer risks a later crash
+  from ghostty's orphaned content layer calling into freed renderer
+  memory. (#242)
+
+- A slow ordinary Host request no longer freezes a live Attach session. (#130)
+
+## [0.1.1] - 2026-08-20
+
+### Added
+
+- Qwen Code appears in Start Agent when the Host has `qwen` on PATH. (#216)
+
+- Pairing Codes can be copied from the Host popup with `c` and pasted in the
+  app, so pairing no longer depends on scanning a QR that may overflow a
+  small terminal. A failed copy prints the code for manual selection. (#204)
+
+### Changed
+
+- When the Agent is Blocked at an approval or question dialog, Composer Send
+  types the draft into the live Attach terminal without pressing Enter, then
+  shows the tools keyboard so Enter or Esc is one tap. If the Host rejects
+  `agent.prompt` with `agent_blocked` after status lagged, Send takes the
+  same path instead of showing a rejection. Idle, Working, Done, and Unknown
+  still deliver through `agent.prompt`. (#217)
+
+### Fixed
+
+- Connecting to a herdr 0.8.2 Host no longer shows the "newer than this app
+  was built against" notice. The committed schema snapshot now matches
+  protocol 20. (#218)
+
+## [0.1.0] - 2026-08-20
+
+### Added
+
+- Pin agents from the Console list with a long-press toggle. Pinned agents
+  stay at the top, most recently pinned first. Long-press a chip in the Agent
+  switcher on the detail screen to pin or unpin it there too. Lock-screen Live
+  Activities show each Host's active agents: status counts plus the top
+  agents (pinned eligible first, then blocked, done, working), updating in
+  near real time while the app is open and via push after it suspends, ending
+  when every agent goes idle. Agent names, titles, and host names stay
+  end-to-end encrypted and are decrypted on device at render time; the relay
+  sees only the counts. Opt in per Host from Notification Settings; requires
+  the updated herdr plugin. (#212)
+
+- Agent detail now places a plus menu to the left of Send. It can add an image
+  from Photos or a file up to 64 MiB from Files, stages the selection privately
+  on the Host over SFTP, and inserts the resulting path into the local draft
+  without submitting it. Discovered Links appear beside the plus menu, while
+  the former title-bar Agent actions live in a separate More menu immediately
+  to its right. Agent detail omits the visible title bar so terminal output uses
+  the full area below the system status bar, while preserving edge-swipe
+  navigation and matching status-bar contrast to the terminal theme. (#182)
+
+- Agent detail now combines the complete live libghostty terminal with a local
+  Composer. The terminal preserves TUI rendering, scrollback, and PTY resize,
+  including touch scrolling in alternate-screen TUIs, but no longer accepts
+  direct keyboard, paste, or pointer-click input.
+  Drafting makes no network requests;
+  Send delivers the complete message once and shows delivery, Agent work, and
+  Done states from acknowledgments and status pushes. Failed messages can be
+  retried or returned to the draft without losing text, and drafts survive
+  terminal recovery, backgrounding, and Host reconnects. The Agent switcher
+  sits at the bottom of the Composer, keeping session changes and the keyboard
+  toggle within reach without reopening the Console. While the keyboard is
+  visible, a neighbouring control switches between the iOS keyboard and a
+  tabbed tools keyboard. Its Agent controls send Esc, Tab, Shift-Tab, arrows,
+  Enter, and Backspace directly to the Agent without changing the draft.
+  The tools dock stays positioned behind the system keyboard and replaces it
+  without exposing the disappearing native candidate row as an empty frame.
+  Both modes share the same complete measured height, including the native iOS
+  candidate and paste area and the Home Indicator area, so switching does not
+  move the Composer or change the terminal's root geometry, grid size, or
+  rendered frame.
+  (#182)
+
+- Settings > About now has Acknowledgements: every redistributed third-party
+  component ships with its exact upstream licence notice, including libssh2
+  and its secondary sources, OpenSSL, Ghostty and its stack, the monospaced
+  fonts, and the rest of the audited inventory. The catalogue fails loudly
+  when a notice is missing or malformed. (#161; PR #170)
+
+- The Keys keyboard's three panes — control keys, Snippets, Appearance — now
+  swipe. Dragging sideways anywhere on the pane moves it under the finger, the
+  tab bar lights the pane being pulled in, and letting go snaps to it; the tabs
+  still work as taps. Control keys now send when the finger lifts rather than
+  when it lands, so a swipe that starts on Esc switches pane instead of sending
+  Esc. Holding a key still repeats.
+
+- Settings now carries an Appearance picker for the app itself: System, Light,
+  or Dark. System follows iOS as before and remains the default; the other two
+  pin the whole app — Console, sheets, and terminals — to one appearance, and
+  the choice sticks across launches.
+
+- Switch Agents without leaving the terminal: a row along the bottom of the
+  terminal lists every Agent with its live status — Working agents pulse — and
+  scrolls horizontally. It stays put whether the keyboard is up or down, so
+  switching Agents no longer means raising the keyboard first, and tapping one
+  attaches with the keyboard exactly as it was. A keyboard button pinned at
+  the row's trailing edge raises and dismisses the keyboard.
+
+- A dedicated newline button above the iOS keyboard inserts a line break into
+  an Agent prompt without pressing Enter or submitting it.
+
+- Hosts now show their live connection state and latest measured ping latency
+  in the Hosts list.
+
+- Start another Agent from the one you have open: "New Agent" in the Agent
+  detail screen's More menu inherits that Agent's Host, workspace, and working
+  directory, so the new Agent starts in a fresh tab in the same place instead
+  of at the workspace root. Only the Agent, its name, and its arguments are
+  left to fill in.
+
+- Attach Links silently collect web and OSC 8 targets into a memory-only list
+  for opening or copying. Links survive terminal recovery and are discarded
+  when Attach ends. (#101, #102, #103, #104; PR #105)
+
+- An iPad-fit Console: on regular widths the Agent list becomes a sidebar
+  beside the open terminal (a split view) instead of stretching edge to edge,
+  and the in-app notification banner caps at a system-banner width. iPhone
+  navigation is unchanged.
+
+- Filter the Agent list by Host: with more than one Host configured, a filter
+  menu in the Console toolbar narrows the list (and its connection notices) to
+  one machine.
+
+- Per-appearance terminal themes: Light Mode and Dark Mode each have their own
+  theme slot, so a dark terminal under a light system is one picker away. The
+  previously selected theme carries over to both slots on upgrade.
+- 20 more curated themes (30 total): Rosé Pine, Ayu, One Half, Kanagawa,
+  Everforest, GitHub, Night Owl, Iceberg, Flexoki, Selenized, Modus, Tomorrow,
+  Melange, Zenbones, One Dark, Snazzy, Oceanic Next, Poimandres, Horizon,
+  Zenburn.
+- The terminal theme now owns the whole Attach screen: its background extends
+  under the navigation bar and into the home-indicator area, and bar/status-bar
+  text follows the theme's luminance instead of the system appearance. (#95)
+- An About section on the Settings root with the app version and build number
+  plus links to the GitHub repository and the privacy policy.
+- Rename Agents and workspaces from the Agent detail screen's menu. Agent
+  names follow the server's rule (lowercase letters, digits, `-`/`_`, up to
+  32 characters) with inline validation, and leaving the name empty falls
+  back to the detected kind. (#98)
+- Start an Agent in a fresh git worktree: a "Start in a new worktree" toggle
+  on the New Agent form gives the task a clean checkout of the selected
+  workspace's repository, with optional branch (validated inline) and base;
+  empty fields use herdr's generated `worktree/` branch off HEAD. (#97)
+
+### Changed
+
+- Lock-screen Live Activities now headline the most urgent agent's task
+  title and show no Host identity. Each agent row is a tap target that
+  opens that agent's detail in the app; a tap outside the rows opens the
+  Console. A reconnect no longer treats a transient empty Agent list as
+  "all idle" and dismisses the activity.
+
+- Live Activity agent lines now lead with the herdr agent name (e.g.
+  `reviewer`) ahead of the task title. Unnamed agents and updates from
+  older plugins render exactly as before.
+
+- App Store builds now target iPhone only. The notification service uses the
+  same device family, so App Store Connect no longer treats iPad screenshots as
+  part of the release requirements.
+
+- Heeler once again supports iOS 18 and later. The removed Dictation feature no
+  longer holds the app at iOS 26, and the bundled OpenSSL/libssh2 artifacts now
+  share the restored iOS 18 deployment target. (#35)
+
+- Notification setup now distinguishes device registration from per-Host
+  configuration, accurately describes relay-visible metadata and Notification
+  Key custody, warns when a custom relay uses cleartext HTTP, and uses
+  Heeler-branded generic fallback alerts. (PR #195)
+
+- Opening an Agent now gives Heeler priority over an existing terminal client.
+  Attach and Reattach use herdr's takeover mode, so a stale mobile connection
+  or a desktop client can no longer prevent the Agent detail terminal from
+  opening. The displaced client is disconnected.
+
+- A Host whose SSH server has stream-local forwarding turned off now says so
+  even when herdr isn't on the SSH session's `PATH`. Heeler tries to start
+  herdr once before giving up; when that attempt itself failed, the checks
+  used to report "the herdr server is not running" and drop the forwarding
+  half of the diagnosis. Since a typical macOS Host keeps herdr at
+  `~/.local/bin` or `/opt/homebrew/bin` — neither on the default `PATH` of an
+  SSH command — that hit exactly the Hosts most likely to need the forwarding
+  advice. (#125)
+
+- Hosts no longer need `socat`. Heeler now reaches herdr's socket over an SSH
+  stream-local forward instead of launching a remote helper per request, so
+  SSH access and a running herdr server are the whole prerequisite. The socat
+  path field is gone from Add/Edit Host, the onboarding checklist has dropped
+  its "socat installed" row, and existing Hosts carry over untouched — nothing
+  to reconfigure. If a Host's SSH server has stream-local forwarding turned
+  off (it is on by default), the checks now say so. (#122)
+
+- The app is now named **Heeler**: the home-screen name, the microphone and
+  camera permission prompts, and the notification extension's display name
+  all say Heeler instead of Herdr. herdr remains the name of the server it
+  connects to; the App Store listing will be "Heeler for herdr". The GitHub
+  repository moved to ZingerLittleBee/Heeler and the in-app repository and
+  privacy-policy links follow (the old URLs redirect).
+- The pairing plugin's id and display name are now both `heeler` (the id was
+  `herdr-mobile.pairing`, the display name `Heeler Pairing`). Hosts still
+  running the plugin under an old id keep working: Notification Registration
+  matches the installed id — current first, then legacy — and writes into
+  that plugin's own config directory, so updating the plugin
+  (`herdr plugin install ZingerLittleBee/Heeler/plugin --ref main --yes`) can
+  happen whenever convenient. After updating it, redo Notification
+  Registration from the app once; pairing and SSH access are unaffected
+  throughout.
+
+- The pair popup now opens full-screen so the Pairing Code QR has the whole
+  terminal to render in. The QR itself is unchanged, so every released app
+  version keeps scanning it.
+
+- The pair popup's address checklist now pre-selects a single default address
+  instead of every likely one: the address on the platform's primary interface
+  (`en0` on macOS, `eth0` on Linux), falling back to the best-ranked private
+  LAN, Tailscale, or ULA candidate when that interface is absent.
+
+- The pair popup's QR screen now renders the code starting at the top row and
+  trims trailing text to the pane height, so the QR can no longer be clipped
+  into scrollback on short terminals.
+
+- Starting a new Agent now opens its terminal as soon as the launch lands,
+  instead of dropping back to the Agent list to hunt for the new row.
+  Launches made from another Agent's screen switch straight over too.
+  (refs #12)
+
+- The Agent detail screen's More menu no longer duplicates Settings; that
+  entry stays in the Console toolbar.
+
+- Working agents in the Console list now show a live "solving" orb — a
+  dotted sphere whose bands twist and click back into place (ported from
+  Jakub Antalik's MIT-licensed thinking-orbs) — instead of the static blue
+  Working capsule. Reduced-motion users get a still frame. (PR #106)
+
+- The Agent list now sorts Done above Working and Working above Idle, in the
+  Console and in the terminal's Agent row alike, so finished work surfaces
+  next to the Blocked agents that still lead the list. Status colours moved
+  onto herdr's own palette — green for Done, yellow for Working, red for
+  Blocked, grey for Idle — so the phone and the TUI agree on what a colour
+  means.
+
+- The Agent Name field on the New Agent form is now optional: empty names the
+  agent after its kind (`claude`, `claude-2`, …), matching how the herdr TUI
+  labels unnamed agents, and the suggested name shows as the placeholder.
+  Typed names are validated inline against herdr's naming rule instead of
+  bouncing off the server.
+- The theme pickers under Terminal Appearance now show a colour swatch for
+  every theme (like the keyboard's Appearance pane) and a live preview of the
+  current pick at the top of each page. The preview moved there from the
+  Terminal Appearance root, and each picker renders its own appearance's half
+  of paired themes regardless of the current system appearance.
+- The Settings sheet is now a shallow menu with two pages, Notifications and
+  Terminal Appearance, instead of one long mixed form. Per-Host notification
+  rows no longer push the appearance controls out of reach, and the
+  self-builder Custom Push Relay field moved to the bottom of the
+  Notifications page.
+
+### Fixed
+
+- Opening an Agent no longer dies with `exec: herdr: not found` (exit 127) on a
+  Host that installed herdr via Homebrew or linuxbrew. The API socket never
+  needed `herdr` on `PATH`, so the Console could already list Agents; Attach
+  and the other CLI execs now append the usual install prefixes after the
+  session `PATH` (`~/.local/bin`, `/opt/homebrew/bin`,
+  `/home/linuxbrew/.linuxbrew/bin`). (#206)
+
+- Malformed herdr API error responses that carry an empty id now fail the
+  originating request immediately with the server's error instead of hanging
+  until the request deadline. herdr answers unparseable requests with
+  `id: ""`; because each API connection serves one request, that empty id is
+  attributable to the sole in-flight request on the connection. (#177)
+
+- On iPad, one window's keyboard no longer ends another window's keyboard
+  handoff. Keyboard notifications are process-wide and each window can hold
+  a live terminal, so a frame event from one window's keyboard transition
+  could unfreeze the other terminal's grid before the keyboard had settled
+  for it. A terminal now heeds a transition only for its own keyboard: it
+  must be first responder, and a frame event must leave the keyboard
+  covering its own window. Process-wide show/hide broadcasts no longer end a
+  handoff. (#157; PR #175)
+
+- Attach again withholds generic remote startup and SSH rc chatter until the
+  attach command begins. The attach exec prints a short handshake marker
+  immediately before `herdr agent attach`, and the client drops everything
+  before it. A channel that dies before the handshake still emits the withheld
+  text once as the diagnosis. (#166)
+
+- An open Agent terminal no longer stays blank after the app may have suspended.
+  Returning at or beyond the Background Grace Period, or after an observed
+  suspension, now shows Connecting while the old PTY stops, then opens a new PTY
+  Attach with a new terminal surface while preserving links, image actions, and
+  pending Paste review. While the Host's replacement snapshot is still loading,
+  the session screen also stays on Connecting instead of briefly claiming the
+  Agent is gone. Brief trips out of the app keep the existing Attach and do not
+  show Connecting. (#141)
+
+- A Host that is reconnecting no longer tells you its Agent has gone. The
+  session screen said "This Agent's pane is no longer reported" whenever the
+  Agent list emptied, which a dropped connection does exactly as a closed
+  pane does — so the app reported a permanent loss at the moment it was
+  successfully recovering. It now says the connection dropped and is being
+  re-established, and that there is nothing for you to do, which is the
+  truth: nothing here needs you. A Host that failed for a reason only you
+  can fix still shows what to do about it, and a pane that really did close
+  still says so. (#154)
+
+- The app no longer quits outright if two parts of the terminal screen read
+  one Attach session at the same time — a stale view left behind by a screen
+  transition was enough. The live terminal now keeps running untouched, and
+  the duplicate reader is turned away with "Another terminal is already open
+  on this Host." and a Reattach button, so the worst case is one surface that
+  has to be reopened rather than the whole app disappearing. (#137)
+
+- A turned-away duplicate terminal reader can no longer take the live
+  terminal down with it. When the refused reader was a terminal screen, its
+  cleanup ended the very session the refusal had just protected, so the
+  working terminal went down anyway; and a duplicate reader whose task was
+  already cancelled ended the working terminal's output silently, with no
+  dialog at all. In both cases the live terminal now keeps running, and the
+  refused surface alone shows "Another terminal is already open on this
+  Host." with Reattach. (#151, #164; PR #174)
+
+- A Host that fails while you have one of its Agents open now says why on the
+  session screen. It used to read "This Agent's pane is no longer reported" —
+  blaming the Agent for the Host's problem, and pointing you at the wrong
+  thing to fix — because a failed Host empties the Agent list in exactly the
+  way a closed pane does. The screen now carries the same connection guidance
+  the Host list shows, so a stopped herdr reads as "herdr is not running on
+  this Host…" where you are actually looking. A pane that really did close on
+  a healthy Host still says so. (#146)
+
+- Cancelling an image upload on a slow connection no longer kills the Host.
+  The cleanup that follows a cancelled or failed upload ran on fixed
+  two-second budgets, and running out of one was treated as evidence that the
+  SSH connection was broken — so on a weak mobile link, cancelling an upload
+  silently tore down Events, Attach, and everything else sharing that
+  connection, and reported it as "The SSH connection is no longer reusable."
+  on whatever you did next. Running out of time is no longer read as a broken
+  connection, and the cleanup no longer opens a second connection it may not
+  have time to finish. A connection that genuinely dies is still reported as
+  dead. (#136)
+
+- A Host that stopped with "herdr is not running on this Host" now recovers on
+  its own once you fix it, however long you were away: restart herdr, come
+  back to the app, and the Host reconnects without you doing anything else.
+  Until now this depended on the length of the trip. Leaving the app for more
+  than about twenty seconds tore the connection down, and coming back rebuilt
+  it, so that route already worked; a quicker trip — or one where iOS froze
+  the app before that teardown could run — did not, and the Host stayed failed
+  with no way back but the Retry button. Every return now asks it once. A Host
+  that is still broken simply says so again, with the same guidance and
+  without flickering through a moment that looks like it reconnected. (#147)
+
+- Coming back to a session after leaving the app no longer shows a connection
+  that is already gone. Returning to the foreground now re-proves each Host,
+  so one whose link died while you were away starts reconnecting — and says
+  so — the moment you look at it, instead of appearing connected for up to
+  another half a minute until the keepalive notices. (#142)
+
+- A Host that drops off the network mid-request now reconnects on its own
+  instead of stopping with the wrong advice. A severed link failed the same
+  way a refused forward does, so Heeler blamed the Host's setup — "herdr is
+  not running on this Host. If it is running, check SSH stream-local
+  forwarding." — and treated it as something only the user could fix, which
+  stops automatic reconnection. A dropped link now reports itself as an
+  unavailable connection and retries, while a genuinely disabled forward or a
+  stopped herdr still gets the setup advice. (#138)
+
+- Hosts running herdr 0.8.0 connect again. The protocol check demanded the
+  exact version this build was generated against, so herdr 0.8.0 (protocol
+  19) failed preflight outright even though every method Heeler calls is
+  unchanged. Heeler now requires a minimum protocol and accepts anything at
+  or above it; a Host newer than this build still connects and simply notes,
+  under the checklist, that features added after it may be unavailable. (#140)
+
+- Host event updates now use herdr's socket directly over SSH, remain live
+  while ordinary requests run, and recover cleanly when only the Events
+  channel drops. Connection failures now lead with "herdr is not running"
+  instead of exposing remote socket implementation language. (#117)
+
+- Switching Agents — from the switcher strip, a notification, or right after
+  starting a new one — no longer strands the terminal on "Connecting…"
+  forever. The synchronous-departure fix let SwiftUI discard the departing
+  screen's state before its teardown task ran, and the weakly-captured
+  teardown then silently skipped itself: the old session was never closed,
+  held the Host's single terminal channel, and every later attach queued
+  behind it indefinitely. The teardown now keeps its store alive until the
+  session is closed. Two hardenings ride along: a screen the Console no
+  longer has on stage refuses to resurrect its terminal on a spurious
+  reappearance, and teardown aborts a session still queued for the channel
+  instead of waiting its turn.
+
+- The Agent switcher strip and the keyboard toolbar no longer vanish when a
+  raised keyboard comes back on its own — returning from the background or
+  the lock screen with the keyboard up. Two causes, same round trip: the
+  keyboard-height measure required a foreground-active scene while UIKit
+  restores the keyboard just before activation, leaving the strip buried
+  behind the keyboard; and the toolbar's hide animation was only ever undone
+  on an explicit keyboard request, so a restored keyboard wore a transparent
+  toolbar.
+
+- The black-terminal-that-never-connects has lost its last hiding place. The
+  earlier reattach fix assumed the spurious disappear/appear pair SwiftUI
+  hands out arrives with a gap in between; when a notification deep link or
+  the new-agent flow's push landed both in one transaction, the deferred
+  teardown ran *after* the reattach had already decided there was nothing to
+  undo, and the visible screen kept a permanently stopped terminal. The
+  departure is now recorded synchronously in `onDisappear`, so the reattach
+  on `onAppear` always sees it.
+
+- Agent status colours are readable in light mode. The Working badge painted
+  its text in Catppuccin Latte's yellow over a wash of the same yellow, which
+  measured 2.3:1 — far under the 4.5:1 that small text needs — and Done's
+  green fared little better; the keyboard switcher's status dot missed the
+  3:1 an indicator needs on white. Badge text and the dot now use a darker
+  ink of the same hue in light mode (dark mode already passed and keeps its
+  pastels), so the phone still speaks herdr's colours, just legibly.
+
+- A Host no longer gets stuck offline because one Agent's pane exited. The
+  events subscription names each Agent's pane, and herdr rejects the whole
+  subscription when a single one of those panes is gone, so a pane that ended
+  while the Host was disconnected left every reconnect failing with
+  "pane … not found" until the Host was edited or the app restarted. Pane
+  subscriptions are now discarded on disconnect and reinstalled from the next
+  sync, and a pane that exits mid-subscribe retries straight away instead of
+  surfacing as a connection failure. Server rejections also read as herdr's
+  own message now, not as a printed Swift value.
+
+- Opening an Agent no longer flashes the Host's login shell across the screen
+  first. The attach channel is a login shell, so its banner, its prompt, and
+  its echo of the attach command all arrived before the Agent did, painted for
+  as long as the attach took to come up, and were then wiped by the Agent's
+  first frame. None of it reaches the terminal now, and "Connecting…" stays up
+  until the Agent actually paints. If an attach dies before it starts, whatever
+  the Host said is still shown — that message is the only diagnosis there is.
+
+- Switching Agents with the keyboard up no longer starts the new terminal at
+  full height and shrinks it a moment later, which also sent the "Connecting…"
+  dialog jumping from the middle of the screen to the middle of the terminal.
+  The keyboard's height now outlives the switch, like the raised keyboard
+  itself already did.
+
+- The terminal's status dialog wears the terminal theme instead of a system
+  material card, so "Connecting…" and "Session Ended" stop looking like a
+  piece of some other app over a Solarized or Nord grid.
+
+- Opening an Agent from a notification no longer sometimes lands on a black
+  terminal that never connects. The Attach screen tore its session down on
+  every `onDisappear`, including the ones SwiftUI hands out for removals the
+  user never made, and the screen that came back afterwards was the same,
+  permanently stopped one: no output, no error, no way to reattach short of
+  switching Agents. It now reattaches when it comes back, and a screen waiting
+  for its terminal says so instead of showing nothing at all.
+
+- The Agent list now removes rows from disconnected Hosts immediately, rejects
+  stale snapshots that finish after a disconnect, and rechecks membership when
+  an Agent process exits back to an ordinary shell.
+
+- The terminal no longer arrives a beat late after the keyboard is dismissed.
+  It now sizes itself to the keyboard directly instead of through SwiftUI's
+  avoidance, which retracted in two stages and left the terminal resizing a
+  second time — reflowing, resizing the remote PTY, and redrawing the whole
+  TUI again — a third of a second after the keyboard had already gone. Raising
+  the keyboard settles in one step too, and the app toolbar leaves in sync
+  with the keyboard instead of lingering at the bottom of the screen.
+
+- Attach no longer leaves a stale-width, non-interactive terminal on screen
+  when an SSH input or resize write fails; the broken session now ends and
+  preserves the underlying transport error.
+
+- Terminal scrolling and typing stay responsive on lossy connections: touch
+  momentum is coalesced and bounded, and fresh keyboard input no longer waits
+  behind stale wheel events.
+
+- Slow or stalled networks no longer leave SSH requests or Host lifecycle
+  transitions stuck indefinitely. Request deadlines now return promptly,
+  invalidate the unusable connection, and discard late connection attempts
+  after the app suspends or reconnects.
+
+- Holding the iOS keyboard's Backspace key now continues deleting instead of
+  stopping after one character.
+
+- Failed Host notices stay compact in the Agent list and open the affected
+  Host directly, where an explicit reconnect action stays visible, animates
+  while restarting, and leaves the latest connection error below it. (PR #107)
+
+- Arguments typed on the New Agent form survive the iOS keyboard's smart
+  punctuation: `--yolo` no longer reaches the Host as an em-dash garbage
+  argument, and curly quotes normalize back to the straight quotes the
+  argument parser understands.
+
+- Taps forwarded to a mouse-tracking TUI now land on the cell Ghostty actually
+  draws under the finger. The tap-to-cell mapper assumed a centred grid, but
+  Ghostty anchors it at a fixed padding; the mismatch shifted reports by up to
+  half a cell (worst on 3x screens) near cell boundaries.
+- Tapping the terminal body no longer toggles the software keyboard. Ghostty's
+  touch handling raised and dismissed the keyboard on any touch once it had
+  been raised once, including after returning from a short backgrounding; both
+  paths are now gated behind the input-row tap policy. (#95)
+- The keyboard tap target in full-screen agent TUIs is now a wider caret band
+  plus the bottom quarter of the screen, instead of the whole surface — output
+  areas stay inert while every chat TUI's pinned input box remains hittable,
+  whichever tool draws it. (#95, refs #90)

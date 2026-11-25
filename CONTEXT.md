@@ -1,0 +1,486 @@
+# Heeler
+
+A native iOS agent console for herdr. One context: the app. Terms owned by herdr keep herdr's meaning; this glossary pins how we use them client-side.
+
+## Language
+
+**Host**:
+A remote machine reachable over SSH that runs a herdr server. The unit a user adds, names, and authenticates against. It is reached on one or more Routes, and its host key is trusted once for all of them.
+_Avoid_: server, machine, connection
+
+**Route**:
+One way to reach a Host: an address and port, optionally resolved from a Jump
+Host, with the first hop optionally carried by an Overlay Network. A Host lists
+its Routes in order; the first is its primary Route, the address shown for it.
+Every connection races the Host's Routes and keeps the first that reaches the
+Host, Routes over the device's own network a moment ahead of the rest — no
+rule picks a Route by Wi-Fi name or location (ADR 0022). A Route that reaches a
+machine presenting another key fails; it is not the Host.
+_Avoid_: path, connection, profile
+
+**Jump Host**:
+An SSH endpoint that forwards a Host connection when the Host is not directly
+reachable from the device. The Host's address and port are resolved from the
+Jump Host, normally through a loopback-only reverse tunnel. The app authenticates
+and verifies host keys independently at both hops. A Jump Host belongs to one
+Route; other Routes of the same Host may reach it without one.
+_Avoid_: bastion, proxy server
+
+**Overlay Network**:
+A Tailscale, ZeroTier, or EasyTier network the user configures in Settings,
+which Heeler joins with a node running inside the app. It is not a system VPN
+and carries nothing but Heeler's own connections. A Route that names one dials
+its first hop through it: the Host itself, or its Jump Host when one is set,
+addressed by its overlay IP or name. Only the byte stream changes; SSH
+authentication, host-key trust, and every channel are the same as a direct
+connection (ADR 0021). Its secrets stay in the Keychain, and its node runs
+only while the app does. EasyTier networks each run as an instance of their
+own, side by side; ZeroTier networks share one device identity.
+_Avoid_: VPN, tunnel, tailnet (for the general term)
+
+**Config Server**:
+An EasyTier web console that assigns EasyTier networks to a device instead
+of the user typing each network's name, secret, and peers. The device
+identifies itself with the console's user name and a Machine ID Heeler
+keeps; the server knows the network secrets and chooses the peers. One
+Config Server is one Overlay Network however many networks it assigns (up
+to eight); a Host on it reaches the assigned network its address or name is
+on.
+_Avoid_: web client, cloud config
+
+**Planet** and **Moon**:
+ZeroTier root definitions. A ZeroTier Overlay Network's Planet is the set of
+root servers it relies on — ZeroTier's own unless the user imports a custom
+planet file for that network's self-hosted roots. Each network has its own;
+networks with different planets run side by side (the node joins every
+network's roots, so lookups may reach any of them). A Moon is an extra root a
+single ZeroTier network orbits, named by its world ID and seed.
+_Avoid_: root server (for the setting), orbit (as a noun)
+
+**Device Key**:
+The device's SSH identity: an Ed25519 keypair generated on this device. The private key never leaves the Keychain; the public half is what a Host authorizes.
+_Avoid_: app key, client key
+
+**RSA Key**:
+The device's alternative SSH identity for a Host that requires RSA-SHA2-512:
+one 3072-bit RSA keypair generated on this device and shared by every Host
+configured for this method. Its private half stays in the Keychain; the user
+registers its OpenSSH public-key line wherever each Host accepts SSH identities.
+Rotating it requires updating every such Host, including both machines when a
+Jump Host is configured.
+_Avoid_: gateway key, provider key, legacy RSA
+
+**Pairing**:
+The full new-device ceremony: scan a Pairing Code, connect with its Bootstrap Key, complete Enrollment, then reconnect with the Device Key. Success produces a working Host, persisted only at that point.
+_Avoid_: scan to connect, binding
+
+**Pairing Code**:
+The versioned pairing payload (candidate addresses, host key fingerprint, Bootstrap Key, expiry). The pairing plugin produces version 1; version 2, produced by an app that bundles its own herdr, also carries a Herdr Endpoint. The QR image is just its rendering.
+_Avoid_: QR code, invite
+
+**Herdr Endpoint**:
+A Host's own herdr instance outside the user's config home, such as one bundled in a desktop app: the absolute path of its API socket and of a launcher that behaves as `herdr` for it. Carried by a Pairing Code v2 and stored on the Host; a Host with one never uses the home-relative session socket or the `herdr` on the SSH PATH.
+_Avoid_: custom socket, herdr path
+
+**Bootstrap Key**:
+A single-use, TTL-bound Ed25519 keypair carried inside a Pairing Code. Its authorized_keys line is restricted to a forced command that can only perform Enrollment; it is destroyed on success or expiry.
+_Avoid_: temp key, one-time password
+
+**Enrollment**:
+The server-side step of Pairing: the forced command appends the Device Key's public key to authorized_keys. Distinct from Pairing as a whole — failure copy must say which step failed.
+_Avoid_: install key, authorization
+
+**Agent**:
+A coding agent process (claude, codex, ...) running inside a herdr pane, as reported by herdr's detection. The primary object of the app.
+_Avoid_: bot, task, session
+
+**Staged Image**:
+A user-selected image that exists on a Host at a remote path, whether or not the Agent has accepted it into a prompt.
+_Avoid_: attachment, uploaded image
+
+**Staged File**:
+A user-selected file that exists on a Host at a remote path, whether or not the Agent has used it from a prompt.
+_Avoid_: attachment, uploaded file
+
+**Image Attachment**:
+A Staged Image that the Agent has accepted into its current prompt as image input.
+_Avoid_: staged image, image path
+
+**Add**:
+The Composer action that prepares one selected image or file, creates a Staged
+Image or Staged File, and inserts its Host path into the local draft without
+submitting it. The action does not assert that the Agent accepted an Image
+Attachment or used a Staged File.
+_Avoid_: attach image, send image, upload image
+
+**Agent Status**:
+herdr's detected state of an Agent: Idle, Working, Blocked, Done, or Unknown. Blocked means the agent is waiting for human input and drives sort order and (later) notifications.
+_Avoid_: agent state, activity
+
+**Pane**:
+herdr's unit of terminal real estate. A Pane hosts either an Agent or an
+ordinary shell — a workspace's root pane starts as a shell. Used as an address
+(`pane_id`), never as a layout concept in this app.
+_Avoid_: window, tile
+
+**Workspace**:
+herdr's unit that groups tabs and panes around one working directory. New
+Agent can start in an existing Workspace, a new Worktree of one, or a new
+Workspace opened at a remote directory. The id is an opaque string.
+_Avoid_: project, folder, window
+
+**Worktree**:
+A fresh git checkout of a workspace's repository, created by herdr as its own
+workspace so a new Agent starts on a clean copy of the code. The branch
+defaults to herdr's generated `worktree/<name>` off HEAD; removing the
+Worktree deletes the checkout and closes its workspace, but the branch
+survives. Snapshot worktree metadata also describes the main checkout; only
+`is_linked_worktree` makes a workspace eligible for linked-Worktree removal.
+_Avoid_: sandbox, branch copy, checkout folder
+
+**Checkout**:
+A git working tree on a Host: a repository's main checkout or one of its linked
+Worktrees. An Agent's Checkout is the one containing the Agent's directory; a
+directory outside any repository has none, even when repositories sit below it.
+_Avoid_: repository, repo, project
+
+**Changes**:
+A Checkout's uncommitted difference against its HEAD (staged, unstaged, and
+untracked files) as last read from the Host, beside the Checkout's latest
+commit. Opened from an Agent but owned by the Checkout, so every Agent in the
+same Checkout shows the same Changes, never "what this Agent changed". Viewing
+Changes never modifies the Checkout.
+_Avoid_: diff, source control, Agent's changes, project changes
+
+**Console**:
+The native dashboard surface, split into Agents, Terminals, Hosts, and Settings tabs; the two lists share one Host filter, and each hides its own search field until pulled down. Agents lists Agents across Hosts as a flat list or collapsible sections By Host or By Workspace, opening Agent detail. Workspace sections are scoped to their Host and ordered by their first Agent in the existing priority order; Agents keep their relative order within each section. Presentation and collapse choices persist, and search opens matching sections without changing those choices. Terminals lists ordinary shell Panes as one card per Workspace, By Workspace or nested By Host, opening Shell Terminal. Hosts is Host management. The Console reopens the list tab it last showed. On an iPad beside its sidebar the tabs give way to the sidebar: a switch between the two lists at its top, Hosts and Settings as sheets from its foot, and each list's search behind a button there.
+_Avoid_: dashboard, home
+
+**Agent Row Layout**:
+The ordered rows of fields that identify an Agent in the Console and its
+switcher. Each Host follows its herdr plugin's fields until the user saves
+that Host's own layout, which may start from a Sync from plugin copy. There
+is no user-facing default layout. The Console shows at most three rows, as
+three fixed Row Slots, and every Agent on a Host shares them: herdr's
+per-kind `rows_by_agent` overrides are decoded but never applied. herdr's
+`state_icon` never appears as a field; the status badge at the end of Row 1
+owns it. Agent Status and Heeler Pin remain independent chrome; choosing
+status as a field repeats it in the row.
+_Avoid_: card template, sidebar format
+
+**Row Slot**:
+One of the three fixed positions in an Agent Row Layout. Row 1 and Row 2 are
+herdr rows: they start from herdr's sidebar fields and are what Sync from
+plugin refills. Row 3 is Heeler's row, which Sync fills only when herdr
+defines a third row. Every slot accepts herdr fields and the Heeler-only
+fields herdr does not define (Host name, Agent Status as text, working
+directory). Slots are never added, moved, or deleted; an empty slot renders
+nothing.
+_Avoid_: extra row, custom row
+
+**Pin**:
+A user-chosen Console marker on an Agent's pane slot (`hostID` + `paneID`).
+Pinned agents float to the top of the Console list and the Live Activity
+by recency. Pins persist locally and are never pruned, so a pane id that
+returns after a herdr restart stays pinned.
+_Avoid_: favorite, star, bookmark
+
+**Composer**:
+The local input control below the Agent's live terminal: a native draft field
+that composes a message entirely on device and delivers it in one piece. Its
+tools keyboard sends explicit keys, including characters on its Terminal page,
+directly to the Agent without editing the draft, while its Snippet and Skill
+tools insert into that draft. A draft insertion edits the draft and nothing
+more; delivery is a separate,
+explicit act.
+Authored delivery is one `agent.prompt` request, except when Agent Status is
+Blocked: Send then inserts the draft into Attach without Enter, and the tools
+keyboard submits or cancels. Delivered means the Host accepted the text into
+the pane — whether the Agent queues or acts on it is the Agent's business,
+and the Composer never claims otherwise.
+While Agent Status is Working and the draft is blank, Send becomes Stop: one
+Esc in the Agent's program, then a wait of up to three seconds for the status
+to leave Working rather than a second Esc. The wait is per Agent, shared by
+Chat and the terminal. With text, Send still delivers, so a prompt can queue
+behind the turn.
+Composer remains the default authored-input path on Agent detail. Direct Input
+is an explicit, opt-in alternative that hides the Composer card without
+clearing or submitting the draft.
+Chat shows the same Composer, draft and staging below the conversation. There
+Send follows Chat's rules instead, while Agent Status is Blocked a Blocked
+Card takes the Composer's place, and with the keyboard down the Composer folds
+to its input row.
+_Avoid_: reply bar, compose bar (the shelved predecessors), input box, message box
+
+**Attach**:
+The realtime PTY stream behind Agent detail, Agent-specific. In Composer mode
+it is display-only: libghostty renders the complete TUI, owns local scrollback,
+and reports its grid size so the remote PTY resizes with the view, while
+authored input belongs to Composer. Direct Input is the scoped exception that
+lets the system keyboard type that same Attach PTY.
+Delivery is one `agent.prompt` request, except when Agent Status is Blocked, in
+which case Composer Send inserts the draft into Attach without Enter and the
+tools keyboard submits or cancels. Only Composer's explicit tools-keyboard
+controls and its Stop (and Direct Input's shortcut row / system Return) send
+terminal control sequences. The directly interactive surface on an ordinary
+shell is the Shell Terminal, never unqualified "Attach".
+Chat holds no Attach: while Chat shows in its place, the Agent's Attach is
+retained like any terminal the user has left, and nothing types into or
+resizes it.
+_Avoid_: takeover (that's herdr's flag, not our surface), connect
+
+**Attach Link**:
+An ordinary web URL observed in the terminal during one Agent detail session. It remains
+available after scrolling or reconnecting, but is forgotten when the user
+leaves the detail; a later session discovers whatever its terminal shows anew.
+_Avoid_: recent link, visible link, link history
+
+**Chat**:
+The native conversation a Claude Code, Codex, Pi or Oh My Pi Agent's detail can show in its
+terminal's place, read from the Agent's Transcript. Chat holds no Attach; its
+Composer and draft are the terminal's. Send is one `agent.prompt` request, made
+only after a screen read shows the program's input box empty, and refused for
+text the program would run rather than read. Its `/` menu offers the Agent's
+skills and `/compact`. Chat never resends: text left in the box after sending
+marks the message Not delivered. Stop presses Esc through `agent.send_keys`.
+The choice between Chat and the terminal is app-wide, Terminal by default. Not
+offered on native Windows Hosts.
+_Avoid_: chat mode, conversation view, Monitor (ADR 0012's removed surface)
+
+**Transcript**:
+The file an Agent's program writes on its Host as its record of the
+conversation: Claude Code's session JSONL, with its subagents' files, or a
+Codex rollout, or a Pi/Oh My Pi v2-v3 tree JSONL. For Pi and Oh My Pi, herdr
+normally names the exact absolute file path; a UUID can also locate a session
+under that program's default sessions directory. The session herdr reports
+names it. Heeler only reads it, over
+SFTP, and keeps decoded entries, never tool output, in an on-device cache.
+_Avoid_: log, history file, session file
+
+**Blocked Card**:
+Chat's native answer to the dialog on a Blocked Agent's screen, shown in the
+Composer's place. Its options come from the screen and the request's details
+from the Transcript; answers go through `agent.send_keys` and
+`pane.send_input`, never Attach. A card sends nothing once the dialog has
+changed and never resends. A dialog it cannot read gets a generic card with
+the Agent controls.
+_Avoid_: approval sheet, permission prompt (the program's own dialog), alert
+
+**Background Work**:
+The Subagents and Workflows a Claude Code Agent runs in the background, which
+Chat lists over the Composer from their launch and end records in the
+Transcript and, for a Workflow, its journal beside it. Running work comes
+first; finished work stays until the user's next prompt. Chat only shows it
+and stops none of it. A Subagent is one background agent; a Workflow is a
+script that runs many and is listed as one row with its agents done.
+_Avoid_: background task, task list, jobs
+
+**Turn**:
+One prompt, command or notification and everything the Agent did in answer,
+as its program records it. Chat folds a finished turn's steps behind a
+"Worked for" row above its final answer, and shows two or more consecutive
+tool calls as one group row; a running turn shows how long it has worked.
+_Avoid_: exchange, round, step (one row within a turn)
+
+**Shell Terminal**:
+The full interactive terminal on an ordinary shell Pane, opened by Agent
+detail's edge-docked Workspace drawer, the Console's Terminals list, or Open
+Terminal. Open Terminal prefers an existing shell in the Workspace and creates
+a tab in the Agent's launch directory only as a fallback or explicit choice.
+Existing shells use direct terminal attach without takeover; Take Over is an
+explicit action when another client owns the terminal. libghostty renders it, and direct keyboard
+input and PTY resize go straight to the remote terminal — no Composer, no
+Agent semantics, no notification routing. Where the detail is pushed over the
+list (iPhone, or a compact iPad window), Open Terminal pushes it over Agent
+detail, so Back returns to the Agent; otherwise it replaces Agent detail while
+open.
+Like Agent detail it has no title bar: the terminal runs up to the status bar,
+and Back and Close Terminal sit behind the More button on its always-present
+input row, headed by the terminal's title.
+Loaded terminals share a limit of five connections per Host, retained for five
+minutes after leaving the view. The least recently viewed idle terminal is
+detached when another needs its slot; remote panes stay alive. Its Keys mode reuses the
+full Terminal keyboard from Agent tools, including characters, modifiers,
+symbols, and function keys, inside the measured iOS keyboard footprint.
+_Avoid_: Attach (that's the Agent-specific display surface), shell console,
+terminal pane view
+
+**Workspace Terminal**:
+A Pane listed with its Host, Workspace, Tab title and current directory.
+Includes Agent panes, which open Agent detail, and ordinary panes, which open
+Shell Terminal. The detail drawer includes every Tab in the current Workspace
+with a New Terminal button pinned below them that opens a fresh shell tab in
+the current pane's directory, and its handle, like the message-jump buttons,
+is long-pressed to slide it along the terminal's edge and rests where it was
+left;
+the Console's Terminals tab shows the ordinary panes of the same inventory as
+Workspace cards, By Workspace or By Host, with New Terminal on each card.
+Discovery is independent of loading: only selecting a terminal opens its PTY.
+_Avoid_: SSH session, tab (a Tab can contain several Workspace Terminals)
+
+**Direct Input**:
+The opt-in Agent-detail mode that hides the Composer card and routes the
+system keyboard plus a compact app-owned shortcut row (Esc, Tab, Shift-Tab,
+Enter) into the live Attach PTY. Its tools keyboard also exposes Skills and
+Snippets, inserting their text into Attach without adding Enter. The draft
+stays in `AgentComposerStore` untouched. Mode preference is app-wide, default off. Distinct from Shell
+Terminal (ordinary shell, no Agent semantics) and from Terminal Keyboard (the
+iOS/tools swap under Composer).
+_Avoid_: Keys mode, terminal mode, raw input, Attach mode
+
+**Terminal Keyboard**:
+The two keyboard modes below Composer, swapped in place at one shared measured
+height. The standard iOS keyboard edits the draft with composition,
+autocorrection, dictation, and language switching. The tools keyboard replaces
+it with a tabbed pad. Its controls tab pages horizontally between large Agent
+controls and a full Terminal keyboard (characters, Ctrl/Alt/Shift, and function
+keys), both sending directly to the pane without changing the Composer draft.
+Paging and key layers always share the measured iOS keyboard height;
+they never resize the dock or the Composer. Skills and Snippets insert into the
+Composer draft or directly into Attach in Direct Input, without adding Enter;
+appearance changes only the terminal rendering. Direct Input shows only the
+full Terminal keyboard in the controls tab, without the Agent page or pager.
+It reuses the same measured footprint for an optional tools dock, but its
+primary shortcuts persist in an app-content
+row above the Agent switcher strip rather than replacing the system keyboard.
+Chat's tools dock keeps the Agent page, whose keys reach the Agent's program
+through `agent.send_keys` in the order pressed, and the Skills and Snippets
+tabs, which insert into the draft. It has no Terminal keyboard and no
+Appearance tab.
+_Avoid_: desktop keyboard, reply keyboard, Keys mode (the direct-input predecessor)
+
+**Snippet**:
+A phrase the user writes once and reuses, kept in one global set independent of
+any Host or Agent. Tapping one inserts its text into the Composer draft and
+nothing more; the user still delivers it. A Snippet may carry a Title: a short
+name the user gives it, shown above its text wherever Snippets are listed.
+_Avoid_: macro, template, shortcut, quick reply, tip
+
+**Agent Notification**:
+A notification telling the user an Agent crossed a notify-worthy status boundary (Blocked, Done): an APNs push while backgrounded or killed, an in-app banner off the live event stream while foregrounded. Deep-links to the Agent's detail surface.
+_Avoid_: alert, push message, task notification
+
+**Push Relay**:
+The developer-hosted, stateless forwarder that holds the APNs credentials and relays encrypted notification payloads from Hosts to Apple. It sees device tokens and ciphertext, never content.
+_Avoid_: server, backend, push service
+
+**Notification Key**:
+The symmetric key generated on device and stored on a Host during Notification Registration; encrypts Agent Notification content end to end so the Push Relay cannot read it.
+_Avoid_: shared secret, push key
+
+**Notification Registration**:
+The act of writing the device's push token and Notification Key to a Host over SSH, as one entry scoped to the herdr session the Host targets. Per host, repeatable, and independent of Pairing; removing it disables Agent Notifications from that Host. Hosts that resolve to the same remote plugin config directory (one SSH user's config home, whatever the address or herdr session) share one registration file: a Host owns only the entry carrying its own Notification Key, and the plugin delivers an entry only to hooks of that entry's session (session names compare exactly). Two Hosts that target the same herdr session share one entry per device, and the one that registered last receives the notifications.
+_Avoid_: subscribe, enable push
+
+**Transport**:
+The app-side abstraction that executes herdr API requests and delivers event streams over SSH. UI code talks to Transport, never to SSH primitives.
+Unix Hosts use direct-streamlocal channels. Native Windows Hosts use herdr's
+official API bridge over SSH exec; their live terminals use its framed terminal
+controller. Both remain behind the same Transport abstraction (ADR 0018).
+_Avoid_: client, bridge, tunnel
+
+**Host Connection Status**:
+Where one Host's events session stands, as the user is entitled to see it. Five
+connection conditions, plus one ownership terminal. Connecting, Reconnecting
+and Connected say connection work is under way or done; Suspended and Failed
+say none is. Ended is not a connection condition at all: it retires the events
+session for good, and belongs to whoever owns that session.
+Connecting means a new activation is establishing its first usable events path
+— the SSH connection, the herdr ping, the events subscription — outside the
+automatic retry loop. Every activation announces it, synchronously, before its
+run begins: a first dial, a return from Suspended, and a Reconnect Request from
+Connected, Reconnecting or Failed alike. Automatic iterations inside one
+activation stay Reconnecting.
+Reconnecting is automatic recovery after a retryable failure, and covers its
+announced backoff as well as the dial that follows. It is observable only while
+that cycle is still the current one. Failed means automatic recovery stopped
+because retrying without user intervention cannot repair the failure. It is
+observable only while no connection work is running; an explicit retry or
+foreground re-proof starts a new Connecting activation and carries the prior
+explanation as Standing Failure.
+Connected means the session established a usable events path and is maintaining
+it on a trusted Transport; a deliberate same-Transport subscription reinstall
+stays Connected through its brief stream gap. Suspended means lifecycle
+teardown deliberately stopped everything until the app is active again. A
+foreground return that finds the connection still believed live proves it with
+a ping and stays Connected while that ping is in flight, so a healthy trip out
+of the app costs the user no churn.
+The status never claims that stopped work is running, and never hides running
+work behind a stopped condition. Whatever a surface then chooses to say is a
+presentation question, answered by Standing Failure and Transport Error
+Presentation.
+_Avoid_: Agent Status, Reconnect Request, loading, syncing
+
+**Agent Inventory**:
+The Agents the Console believes a Host has. It is replaced wholesale when a
+snapshot lands, never merged, because herdr replays no state on subscribe.
+It becomes unknown when a Host Connection Status transition invalidates the
+prior snapshot — so an empty Console during a connection problem means unknown
+rather than none, and the window between a fresh Connected and its first
+snapshot is loading rather than empty. A same-Transport subscription reinstall
+is not such a transition and may keep the current inventory until its refresh
+lands.
+Readiness is a data condition and not a Host Connection Status: a Host is
+Connected while its inventory is still unknown. Surfaces say the Agents are
+loading there. They must not say the Host is connecting, and must never say a
+pane is gone, which is answerable only once the inventory is known.
+_Avoid_: agent list, snapshot state, syncing
+
+**Standing Failure**:
+The failure that last stopped automatic recovery on a Host, kept after the next
+activation begins and discarded only when that activation resolves — by
+connecting, by entering automatic recovery, or by failing again, which replaces
+it.
+It exists so Host Connection Status can report running work honestly without
+the app withdrawing the explanation at the moment the user is reading it: a
+Host re-proved on a foreground return is Connecting, and every status-derived
+surface keeps presenting the Standing Failure until the activation answers,
+except that a Reconnect Request may temporarily suppress the Host detail footer
+while its button shows request progress. The failure remains stored and
+continues to render on Agent detail, the Console, and the Hosts list.
+Only a failure that reached Failed becomes standing. A retryable failure inside
+a recovery cycle does not, because nothing stopped and Reconnecting already
+says what happened.
+_Avoid_: last error, cached failure, sticky error
+
+**Transport Error Presentation**:
+What one `TransportError` is allowed to say to the user: a Summary naming what
+happened, an optional Detail carrying the error's own interpolated text, and an
+optional Recovery Suggestion naming something the user can do about it. It is
+total over the error set and is therefore not only about connections — a
+rejected herdr request means the connection worked — so it serves failed
+one-off requests as readily as a stopped Host.
+The Suggestion is optional because most errors do not support one: of the
+errors automatic retry accepts, only an unreachable Host does. An API total
+over the set may not promise that every case is actionable. Detail is the
+error's own words, never authored instruction: a transport's failure string, or
+herdr's own code and message.
+Which parts a surface shows is decided by whether anything but the user can
+change the outcome. A Failed Host shows the whole presentation, and so does a
+failed one-off request wherever the surface has no more specific words of its
+own, because in both cases nothing changes until the user acts. While
+automatic recovery is running, no surface shows the Recovery Suggestion — an
+instruction misstates who has to act and invites a restart that discards the
+attempt already running — so Reconnecting shows the Summary, and, where the
+surface is about one Host's connection health rather than about the Agents, the
+Detail with it. A Hosts list row names a problem by its Summary alone, beside
+Retry once the Host stops; Host detail, one tap away, shows the rest. A first-hop failure is presented against the Jump Host; where no
+Jump-Host-directed text exists, the Suggestion is dropped rather than aimed at
+the wrong machine.
+This replaces Connection Guidance, whose name promised an instruction that the
+retryable errors never carried.
+_Avoid_: Connection Guidance, error message, connection error, retry hint,
+actionable error
+
+**Reconnect Request**:
+A user's explicit Reconnect press on Host detail, and the brief window in which
+the app shows that press being served. It is feedback about a request, not a
+Host Connection Status: it is never derived from the status and never changes
+it, an automatic Reconnecting is not a Reconnect Request, and a press in flight
+suppresses the Host detail failure footer while driving the button's own
+progress (#160).
+_Avoid_: retry, reconnecting, manual reconnect state
+
+**Background Grace Period**:
+The window after backgrounding during which the app keeps running under an iOS background-execution assertion and holds its Host connections, so a short trip out of the app costs nothing on return. Only when it elapses does the app suspend and tear the connections down. Bounded by what iOS grants (tens of seconds); staying reachable for longer is what Agent Notifications are for.
+_Avoid_: background mode, keep alive (that's the events session's ping)
